@@ -24,12 +24,15 @@ func NewDAO(db *sqlx.DB) *DAO { return &DAO{db: db} }
 func (d *DAO) Create(ctx context.Context, t *Task) error {
 	res, err := d.db.ExecContext(ctx, `
 INSERT INTO image_tasks
-  (task_id, user_id, key_id, model_id, account_id, prompt, n, size, status,
-   conversation_id, file_ids, result_urls, error, estimated_credit, credit_cost,
+  (task_id, user_id, key_id, model_id, account_id, prompt, n, size, operation,
+   provider_kind, route_policy, request_options_json, attempt_count, switch_count,
+   status, conversation_id, file_ids, result_urls, error, estimated_credit, credit_cost,
    created_at)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, NOW())`,
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, NOW())`,
 		t.TaskID, t.UserID, t.KeyID, t.ModelID, t.AccountID,
-		t.Prompt, t.N, t.Size, nullEmpty(t.Status, StatusQueued),
+		t.Prompt, t.N, t.Size, nullEmpty(t.Operation, OperationGenerate),
+		nullEmpty(t.ProviderKind, ProviderReverse), nullEmpty(t.RoutePolicy, RoutePolicyAuto),
+		nullJSON(t.RequestOptionsJSON), t.AttemptCount, t.SwitchCount, nullEmpty(t.Status, StatusQueued),
 		t.ConversationID, nullJSON(t.FileIDs), nullJSON(t.ResultURLs),
 		t.Error, t.EstimatedCredit, t.CreditCost,
 	)
@@ -76,6 +79,25 @@ UPDATE image_tasks
 	return err
 }
 
+// SetExecutionMeta 记录最终执行 provider 与尝试信息。
+func (d *DAO) SetExecutionMeta(ctx context.Context, taskID, operation, providerKind, routePolicy string,
+	requestOptions []byte, attemptCount, switchCount int, accountID uint64) error {
+	_, err := d.db.ExecContext(ctx, `
+UPDATE image_tasks
+   SET operation = ?,
+       provider_kind = ?,
+       route_policy = ?,
+       request_options_json = ?,
+       attempt_count = ?,
+       switch_count = ?,
+       account_id = CASE WHEN ? > 0 THEN ? ELSE account_id END
+ WHERE task_id = ?`,
+		operation, providerKind, routePolicy, nullJSON(requestOptions),
+		attemptCount, switchCount, accountID, accountID, taskID,
+	)
+	return err
+}
+
 // UpdateCost 仅更新 credit_cost(Runner 成功后由网关层调用)。
 func (d *DAO) UpdateCost(ctx context.Context, taskID string, cost int64) error {
 	_, err := d.db.ExecContext(ctx,
@@ -97,6 +119,7 @@ func (d *DAO) Get(ctx context.Context, taskID string) (*Task, error) {
 	var t Task
 	err := d.db.GetContext(ctx, &t, `
 SELECT id, task_id, user_id, key_id, model_id, account_id, prompt, n, size, status,
+       operation, provider_kind, route_policy, request_options_json, attempt_count, switch_count,
        conversation_id, file_ids, result_urls, error, estimated_credit, credit_cost,
        created_at, started_at, finished_at
   FROM image_tasks
@@ -118,6 +141,7 @@ func (d *DAO) ListByUser(ctx context.Context, userID uint64, limit, offset int) 
 	var out []Task
 	err := d.db.SelectContext(ctx, &out, `
 SELECT id, task_id, user_id, key_id, model_id, account_id, prompt, n, size, status,
+       operation, provider_kind, route_policy, request_options_json, attempt_count, switch_count,
        conversation_id, file_ids, result_urls, error, estimated_credit, credit_cost,
        created_at, started_at, finished_at
   FROM image_tasks
@@ -125,6 +149,46 @@ SELECT id, task_id, user_id, key_id, model_id, account_id, prompt, n, size, stat
  ORDER BY id DESC
  LIMIT ? OFFSET ?`, userID, limit, offset)
 	return out, err
+}
+
+// ReplaceOutputs 用统一产物替换指定 task 的结果。
+func (d *DAO) ReplaceOutputs(ctx context.Context, taskID string, outputs []TaskOutput) error {
+	tx, err := d.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	if _, err = tx.ExecContext(ctx, `DELETE FROM image_task_outputs WHERE task_id = ?`, taskID); err != nil {
+		return err
+	}
+	for _, out := range outputs {
+		_, err = tx.ExecContext(ctx, `
+INSERT INTO image_task_outputs
+  (task_id, output_index, source_type, source_ref, content_type, revised_prompt, meta_json)
+VALUES (?,?,?,?,?,?,?)`,
+			taskID, out.OutputIndex, out.SourceType, out.SourceRef, out.ContentType,
+			out.RevisedPrompt, nullJSON(out.MetaJSON),
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// ListOutputs 读取统一图片产物。
+func (d *DAO) ListOutputs(ctx context.Context, taskID string) ([]TaskOutput, error) {
+	rows := make([]TaskOutput, 0, 4)
+	err := d.db.SelectContext(ctx, &rows, `
+SELECT id, task_id, output_index, source_type, source_ref, content_type, revised_prompt, meta_json, created_at
+  FROM image_task_outputs
+ WHERE task_id = ?
+ ORDER BY output_index ASC`, taskID)
+	return rows, err
 }
 
 // DecodeFileIDs 把 JSON 列解出字符串数组。

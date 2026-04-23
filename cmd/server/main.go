@@ -142,7 +142,8 @@ func main() {
 	}
 
 	imageDAO := image.NewDAO(sqldb)
-	imageRunner := image.NewRunner(sched, imageDAO)
+	imageStorage := image.NewStorage("")
+	imageRunner := image.NewRunner(sched, imageDAO, imageStorage)
 	imagesH := &gateway.ImagesHandler{
 		Handler: gwH,
 		Runner:  imageRunner,
@@ -200,6 +201,7 @@ func main() {
 	settingsH := settings.NewHandler(settingsSvc, mailSvc, auditDAO)
 	authSvc.SetSettings(settingsSvc)
 	authSvc.SetBilling(billEngine)
+	imageRunner.SetRouteConfigProvider(settingsSvc)
 
 	// 把 settings 注入到其它受控业务(可热更)
 	keySvc.SetSettings(settingsSvc)

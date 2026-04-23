@@ -3,7 +3,9 @@ package account
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,10 +29,16 @@ type CreateInput struct {
 	AuthToken        string    `json:"auth_token"`
 	RefreshToken     string    `json:"refresh_token"`
 	SessionToken     string    `json:"session_token"`
+	APIKey           string    `json:"api_key"`
 	TokenExpiresAt   time.Time `json:"token_expires_at"`
 	OAISessionID     string    `json:"oai_session_id"`
 	OAIDeviceID      string    `json:"oai_device_id"`
 	ClientID         string    `json:"client_id"`
+	APIBaseURL       string    `json:"api_base_url"`
+	ProviderKind     string          `json:"provider_kind"`
+	ImageCapabilities map[string]bool `json:"image_capabilities"`
+	SameAccountRetryLimit int        `json:"same_account_retry_limit"`
+	Priority         int             `json:"priority"`
 	ChatGPTAccountID string    `json:"chatgpt_account_id"`
 	AccountType      string    `json:"account_type"`
 	PlanType         string    `json:"plan_type"`
@@ -46,10 +54,16 @@ type UpdateInput struct {
 	AuthToken        string    `json:"auth_token"`
 	RefreshToken     string    `json:"refresh_token"`
 	SessionToken     string    `json:"session_token"`
+	APIKey           string    `json:"api_key"`
 	TokenExpiresAt   time.Time `json:"token_expires_at"`
 	OAISessionID     string    `json:"oai_session_id"`
 	OAIDeviceID      string    `json:"oai_device_id"`
 	ClientID         string    `json:"client_id"`
+	APIBaseURL       string    `json:"api_base_url"`
+	ProviderKind     string           `json:"provider_kind"`
+	ImageCapabilities map[string]bool `json:"image_capabilities"`
+	SameAccountRetryLimit *int        `json:"same_account_retry_limit"`
+	Priority         *int             `json:"priority"`
 	ChatGPTAccountID string    `json:"chatgpt_account_id"`
 	AccountType      string    `json:"account_type"`
 	PlanType         string    `json:"plan_type"`
@@ -60,14 +74,29 @@ type UpdateInput struct {
 }
 
 func (s *Service) Create(ctx context.Context, in CreateInput) (*Account, error) {
-	if in.Email == "" || in.AuthToken == "" {
-		return nil, errors.New("email 和 auth_token 不能为空")
+	in.Email = strings.TrimSpace(in.Email)
+	if in.Email == "" {
+		return nil, errors.New("email 不能为空")
 	}
-	atEnc, err := s.cipher.EncryptString(in.AuthToken)
-	if err != nil {
-		return nil, err
+	if in.ProviderKind == "" {
+		in.ProviderKind = ProviderKindReverse
+	}
+	if in.ProviderKind == ProviderKindReverse && strings.TrimSpace(in.AuthToken) == "" {
+		return nil, errors.New("reverse 账号必须提供 auth_token")
+	}
+	if in.ProviderKind != ProviderKindReverse && strings.TrimSpace(in.APIKey) == "" {
+		return nil, errors.New("native/responses 账号必须提供 api_key")
+	}
+	var atEnc string
+	if in.AuthToken != "" {
+		var err error
+		atEnc, err = s.cipher.EncryptString(in.AuthToken)
+		if err != nil {
+			return nil, err
+		}
 	}
 	var rtEnc, stEnc sql.NullString
+	var apiKeyEnc sql.NullString
 	if in.RefreshToken != "" {
 		v, err := s.cipher.EncryptString(in.RefreshToken)
 		if err != nil {
@@ -82,6 +111,13 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Account, error) 
 		}
 		stEnc = sql.NullString{String: v, Valid: true}
 	}
+	if in.APIKey != "" {
+		v, err := s.cipher.EncryptString(in.APIKey)
+		if err != nil {
+			return nil, err
+		}
+		apiKeyEnc = sql.NullString{String: v, Valid: true}
+	}
 	if in.OAIDeviceID == "" {
 		in.OAIDeviceID = uuid.NewString()
 	}
@@ -94,13 +130,25 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Account, error) 
 	if in.ClientID == "" {
 		in.ClientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 	}
+	if in.APIBaseURL == "" {
+		in.APIBaseURL = "https://api.openai.com/v1"
+	}
 	if in.AccountType == "" {
 		in.AccountType = "codex"
 	}
+	if in.SameAccountRetryLimit <= 0 {
+		in.SameAccountRetryLimit = 1
+	}
+	var caps []byte
+	if len(in.ImageCapabilities) > 0 {
+		caps, _ = json.Marshal(in.ImageCapabilities)
+	}
 	a := &Account{
-		Email: in.Email, AuthTokenEnc: atEnc, RefreshTokenEnc: rtEnc, SessionTokenEnc: stEnc,
+		Email: in.Email, AuthTokenEnc: atEnc, RefreshTokenEnc: rtEnc, SessionTokenEnc: stEnc, APIKeyEnc: apiKeyEnc,
 		OAISessionID: in.OAISessionID, OAIDeviceID: in.OAIDeviceID,
-		ClientID: in.ClientID, ChatGPTAccountID: in.ChatGPTAccountID, AccountType: in.AccountType,
+		ClientID: in.ClientID, APIBaseURL: strings.TrimRight(in.APIBaseURL, "/"), ProviderKind: in.ProviderKind,
+		ImageCapabilities: caps, SameAccountRetryLimit: in.SameAccountRetryLimit, Priority: in.Priority,
+		ChatGPTAccountID: in.ChatGPTAccountID, AccountType: in.AccountType,
 		PlanType: in.PlanType, DailyImageQuota: in.DailyImageQuota,
 		Status: StatusHealthy, Notes: in.Notes,
 	}
@@ -163,6 +211,13 @@ func (s *Service) Update(ctx context.Context, id uint64, in UpdateInput) (*Accou
 		}
 		a.SessionTokenEnc = sql.NullString{String: enc, Valid: true}
 	}
+	if in.APIKey != "" {
+		enc, err := s.cipher.EncryptString(in.APIKey)
+		if err != nil {
+			return nil, err
+		}
+		a.APIKeyEnc = sql.NullString{String: enc, Valid: true}
+	}
 	if !in.TokenExpiresAt.IsZero() {
 		a.TokenExpiresAt = sql.NullTime{Time: in.TokenExpiresAt, Valid: true}
 	} else if in.AuthToken != "" {
@@ -178,6 +233,21 @@ func (s *Service) Update(ctx context.Context, id uint64, in UpdateInput) (*Accou
 	}
 	if in.ClientID != "" {
 		a.ClientID = in.ClientID
+	}
+	if in.APIBaseURL != "" {
+		a.APIBaseURL = strings.TrimRight(in.APIBaseURL, "/")
+	}
+	if in.ProviderKind != "" {
+		a.ProviderKind = in.ProviderKind
+	}
+	if len(in.ImageCapabilities) > 0 {
+		a.ImageCapabilities, _ = json.Marshal(in.ImageCapabilities)
+	}
+	if in.SameAccountRetryLimit != nil && *in.SameAccountRetryLimit > 0 {
+		a.SameAccountRetryLimit = *in.SameAccountRetryLimit
+	}
+	if in.Priority != nil {
+		a.Priority = *in.Priority
 	}
 	if in.ChatGPTAccountID != "" {
 		a.ChatGPTAccountID = in.ChatGPTAccountID
@@ -195,6 +265,15 @@ func (s *Service) Update(ctx context.Context, id uint64, in UpdateInput) (*Accou
 		a.Status = in.Status
 	}
 	a.Notes = in.Notes
+	if a.ProviderKind == "" {
+		a.ProviderKind = ProviderKindReverse
+	}
+	if a.ProviderKind == ProviderKindReverse && a.AuthTokenEnc == "" {
+		return nil, errors.New("reverse 账号必须提供 auth_token")
+	}
+	if a.ProviderKind != ProviderKindReverse && (!a.APIKeyEnc.Valid || a.APIKeyEnc.String == "") {
+		return nil, errors.New("native/responses 账号必须提供 api_key")
+	}
 	if err := s.dao.Update(ctx, a); err != nil {
 		return nil, err
 	}
@@ -250,6 +329,7 @@ type AccountSecrets struct {
 	AuthToken    string `json:"auth_token"`
 	RefreshToken string `json:"refresh_token"`
 	SessionToken string `json:"session_token"`
+	APIKey       string `json:"api_key"`
 }
 
 // GetSecrets 返回指定账号的 AT/RT/ST 明文(用于后台编辑弹窗回显)。
@@ -274,6 +354,11 @@ func (s *Service) GetSecrets(ctx context.Context, id uint64) (*AccountSecrets, e
 			out.SessionToken = v
 		}
 	}
+	if a.APIKeyEnc.Valid && a.APIKeyEnc.String != "" {
+		if v, err := s.cipher.DecryptString(a.APIKeyEnc.String); err == nil {
+			out.APIKey = v
+		}
+	}
 	return out, nil
 }
 
@@ -292,6 +377,14 @@ func (s *Service) DecryptCookies(ctx context.Context, accountID uint64) (string,
 // GetBinding 查账号-代理绑定。
 func (s *Service) GetBinding(ctx context.Context, accountID uint64) (*Binding, error) {
 	return s.dao.GetBinding(ctx, accountID)
+}
+
+// DecryptAPIKey 解密 API key。
+func (s *Service) DecryptAPIKey(a *Account) (string, error) {
+	if a == nil || !a.APIKeyEnc.Valid || a.APIKeyEnc.String == "" {
+		return "", nil
+	}
+	return s.cipher.DecryptString(a.APIKeyEnc.String)
 }
 
 // DAO 暴露给调度器使用。

@@ -23,18 +23,15 @@ package gateway
 
 import (
 	"context"
-	"crypto/hmac"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	"github.com/432539/gpt2api/internal/image"
 	"github.com/432539/gpt2api/internal/upstream/chatgpt"
 	"github.com/432539/gpt2api/pkg/logger"
 )
@@ -44,48 +41,6 @@ import (
 type ImageAccountResolver interface {
 	AuthToken(ctx context.Context, accountID uint64) (at, deviceID, cookies string, err error)
 	ProxyURL(ctx context.Context, accountID uint64) string
-}
-
-// imageProxySecret 进程级随机密钥,用于 HMAC 签名图片 URL。
-// 进程重启后旧的签名 URL 全部失效,这是故意的(防止长期有效的 URL 泄漏)。
-var imageProxySecret []byte
-
-func init() {
-	imageProxySecret = make([]byte, 32)
-	if _, err := rand.Read(imageProxySecret); err != nil {
-		for i := range imageProxySecret {
-			imageProxySecret[i] = byte(i*31 + 7)
-		}
-	}
-}
-
-// ImageProxyTTL 单条签名 URL 的默认有效期(24h,够前端离线展示一段时间)。
-const ImageProxyTTL = 24 * time.Hour
-
-// BuildImageProxyURL 生成代理 URL。返回绝对 path(不含 host),调用方可以直接拼或交给前端同 origin 使用。
-//
-// 默认 ttl=24h。前端展示一张历史图片,最多走一次上游获取 bytes,之后浏览器缓存即可。
-func BuildImageProxyURL(taskID string, idx int, ttl time.Duration) string {
-	if ttl <= 0 {
-		ttl = ImageProxyTTL
-	}
-	expMs := time.Now().Add(ttl).UnixMilli()
-	sig := computeImgSig(taskID, idx, expMs)
-	return fmt.Sprintf("/p/img/%s/%d?exp=%d&sig=%s", taskID, idx, expMs, sig)
-}
-
-func computeImgSig(taskID string, idx int, expMs int64) string {
-	mac := hmac.New(sha256.New, imageProxySecret)
-	fmt.Fprintf(mac, "%s|%d|%d", taskID, idx, expMs)
-	return hex.EncodeToString(mac.Sum(nil))[:24]
-}
-
-func verifyImgSig(taskID string, idx int, expMs int64, sig string) bool {
-	if expMs < time.Now().UnixMilli() {
-		return false
-	}
-	want := computeImgSig(taskID, idx, expMs)
-	return hmac.Equal([]byte(sig), []byte(want))
 }
 
 // ImageProxy 按签名代理下载上游图片。无需 API Key,只靠 URL 签名校验。
@@ -109,7 +64,7 @@ func (h *ImagesHandler) ImageProxy(c *gin.Context) {
 		c.AbortWithStatus(http.StatusBadRequest)
 		return
 	}
-	if !verifyImgSig(taskID, idx, expMs, sig) {
+	if !image.VerifyImageProxyURL(taskID, idx, expMs, sig) {
 		c.AbortWithStatus(http.StatusForbidden)
 		return
 	}
@@ -122,6 +77,32 @@ func (h *ImagesHandler) ImageProxy(c *gin.Context) {
 	if err != nil {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
+	}
+	outputs, _ := h.DAO.ListOutputs(c.Request.Context(), taskID)
+	if idx < len(outputs) {
+		out := outputs[idx]
+		switch out.SourceType {
+		case "stored_blob":
+			body, err := os.ReadFile(out.SourceRef)
+			if err != nil {
+				c.AbortWithStatus(http.StatusBadGateway)
+				return
+			}
+			ct := out.ContentType
+			if ct == "" {
+				ct = "image/png"
+			}
+			c.Header("Cache-Control", "private, max-age=1800")
+			c.Data(http.StatusOK, ct, body)
+			return
+		case "remote_url":
+			http.Redirect(c.Writer, c.Request, out.SourceRef, http.StatusTemporaryRedirect)
+			return
+		case "chatgpt_ref":
+			// 继续走 legacy reverse 下载链路。
+		default:
+			// 回退到 legacy 逻辑。
+		}
 	}
 	fids := t.DecodeFileIDs()
 	if idx >= len(fids) {

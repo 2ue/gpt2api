@@ -302,6 +302,13 @@ func (s *Service) AccountDefaultClientID() string {
 	return firstNonEmpty(s.GetString(AccountDefaultClientID), "app_EMoamEEZ73f0CkXaXp7hrann")
 }
 
+// -- image routing --
+func (s *Service) ImageReverseOnly() bool              { return s.GetBool(ImageReverseOnly) }
+func (s *Service) ImageNativeEnabled() bool            { return s.GetBool(ImageNativeEnabled) }
+func (s *Service) ImageResponsesFallbackEnabled() bool { return s.GetBool(ImageResponsesFallbackEnabled) }
+func (s *Service) ImageResponsesDirectEnabled() bool   { return s.GetBool(ImageResponsesDirectEnabled) }
+func (s *Service) ImageSafeMode() bool                 { return s.GetBool(ImageSafeMode) }
+
 // -- billing / recharge --
 func (s *Service) RechargeEnabled() bool    { return s.GetBool(RechargeEnabled) }
 func (s *Service) RechargeMinCNY() int64    { n := s.GetInt(RechargeMinCNY); if n < 0 { return 0 }; return n }

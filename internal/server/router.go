@@ -335,6 +335,8 @@ func New(d *Deps) *gin.Engine {
 		if d.ImagesH != nil {
 			v1.POST("/images/generations", d.ImagesH.ImageGenerations)
 			v1.POST("/images/edits", d.ImagesH.ImageEdits)
+			v1.POST("/images/responses/generations", d.ImagesH.ImageResponsesGenerations)
+			v1.POST("/images/responses/edits", d.ImagesH.ImageResponsesEdits)
 			v1.GET("/images/tasks/:id", d.ImagesH.ImageTask)
 		}
 	}

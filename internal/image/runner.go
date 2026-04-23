@@ -25,11 +25,13 @@ import (
 type Runner struct {
 	sched *scheduler.Scheduler
 	dao   *DAO
+	storage *Storage
+	routeCfg ImageRouteConfigProvider
 }
 
 // NewRunner 构造 Runner。
-func NewRunner(sched *scheduler.Scheduler, dao *DAO) *Runner {
-	return &Runner{sched: sched, dao: dao}
+func NewRunner(sched *scheduler.Scheduler, dao *DAO, storage *Storage) *Runner {
+	return &Runner{sched: sched, dao: dao, storage: storage}
 }
 
 // ReferenceImage 是图生图/编辑的一张参考图输入。
@@ -46,12 +48,10 @@ type RunOptions struct {
 	KeyID             uint64
 	ModelID           uint64
 	UpstreamModel     string // 默认 "auto"(由上游根据 system_hints 挑选图像模型)
-	Prompt            string
-	N                 int                // 目前上游单次返回固定,N 仅用于计费
+	Request           CanonicalRequest
 	MaxAttempts       int                // 灰度未命中时最大重试,默认 2
 	PerAttemptTimeout time.Duration      // 单次尝试总超时,默认 5min
 	PollMaxWait       time.Duration      // 轮询最长等待,默认 300s
-	References        []ReferenceImage   // 图生图/编辑:参考图
 }
 
 // RunResult 是单次生图的输出。
@@ -62,17 +62,27 @@ type RunResult struct {
 	FileIDs        []string // chatgpt.com 侧的原始 ref("sed:" 前缀表示 sediment)
 	SignedURLs     []string // 直接可访问的签名 URL(15 分钟有效)
 	ContentTypes   []string
+	B64JSON        []string
+	RevisedPrompts []string
+	ProviderKind   string
+	RoutePolicy    string
+	Outputs        []TaskOutput
 	ErrorCode      string
 	ErrorMessage   string
 	Attempts       int   // 跨账号尝试次数(runOnce 次数)
+	SwitchCount    int
 	TurnsInConv    int   // 当前账号内同会话 picture_v2 轮次
 	IsPreview      bool  // true=返回的是 IMG1 sediment 预览(3 轮均未命中 IMG2 灰度,已尽力)
 	DurationMs     int64
 }
 
-// Run 执行生图。会同步阻塞直到完成/失败;调用方自行做超时控制(传 ctx)。
-func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
+// SetRouteConfigProvider 注入图片路由开关。
+func (r *Runner) SetRouteConfigProvider(p ImageRouteConfigProvider) { r.routeCfg = p }
+
+// runReverse 执行 reverse provider。
+func (r *Runner) runReverse(ctx context.Context, opt RunOptions) *RunResult {
 	start := time.Now()
+	opt.Request.Normalize()
 	if opt.MaxAttempts <= 0 {
 		opt.MaxAttempts = 2
 	}
@@ -88,15 +98,15 @@ func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 		// 这是图像任务。硬写 "gpt-5-3" 在免费/新账号上会直接 404。
 		opt.UpstreamModel = "auto"
 	}
-	if opt.N <= 0 {
-		opt.N = 1
+	if opt.Request.N <= 0 {
+		opt.Request.N = 1
 	}
 
-	result := &RunResult{Status: StatusFailed, ErrorCode: ErrUnknown}
-
-	// 仅当有 DAO 和 taskID 时才落库
-	if r.dao != nil && opt.TaskID != "" {
-		_ = r.dao.MarkRunning(ctx, opt.TaskID, 0)
+	result := &RunResult{
+		Status:       StatusFailed,
+		ErrorCode:    ErrUnknown,
+		ProviderKind: ProviderReverse,
+		RoutePolicy:  opt.Request.RoutePolicy,
 	}
 
 	for attempt := 1; attempt <= opt.MaxAttempts; attempt++ {
@@ -132,16 +142,6 @@ func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 	}
 
 	result.DurationMs = time.Since(start).Milliseconds()
-
-	// 落库
-	if r.dao != nil && opt.TaskID != "" {
-		if result.Status == StatusSuccess {
-			_ = r.dao.MarkSuccess(ctx, opt.TaskID, result.ConversationID,
-				result.FileIDs, result.SignedURLs, 0 /* credit_cost 由网关负责写 */)
-		} else {
-			_ = r.dao.MarkFailed(ctx, opt.TaskID, result.ErrorCode)
-		}
-	}
 	return result
 }
 
@@ -149,7 +149,12 @@ func (r *Runner) Run(ctx context.Context, opt RunOptions) *RunResult {
 // result 会被就地更新(ConversationID / FileIDs / SignedURLs / AccountID 等)。
 func (r *Runner) runOnce(ctx context.Context, opt RunOptions, result *RunResult) (bool, string, error) {
 	// 1) 调度账号
-	lease, err := r.sched.Dispatch(ctx, "image")
+	lease, err := r.sched.DispatchImage(ctx, scheduler.DispatchSpec{
+		Operation:           opt.Request.Operation,
+		PreferredProvider:   ProviderReverse,
+		AllowedProviders:    []string{ProviderReverse},
+		NeedReferenceImages: opt.Request.HasReferenceImages(),
+	})
 	if err != nil {
 		if errors.Is(err, scheduler.ErrNoAvailable) {
 			return false, ErrNoAccount, err
@@ -216,9 +221,12 @@ func (r *Runner) runOnce(ctx context.Context, opt RunOptions, result *RunResult)
 	// 会通过 f/conversation 的 payload 字段传达。
 
 	// 4.5) 图生图:上传参考图。任何一张失败都直接整体 fail(上游后续会对不上 attachment)。
+	refsInput := make([]InputImage, 0, len(opt.Request.BaseImages)+len(opt.Request.ReferenceImages))
+	refsInput = append(refsInput, opt.Request.BaseImages...)
+	refsInput = append(refsInput, opt.Request.ReferenceImages...)
 	var refs []*chatgpt.UploadedFile
-	if len(opt.References) > 0 {
-		for idx, r0 := range opt.References {
+	if len(refsInput) > 0 {
+		for idx, r0 := range refsInput {
 			upCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			up, err := cli.UploadFile(upCtx, r0.Data, r0.FileName)
 			cancel()
@@ -303,7 +311,7 @@ loop:
 		}
 
 		convOpt := chatgpt.ImageConvOpts{
-			Prompt:        opt.Prompt,
+			Prompt:        opt.Request.Prompt,
 			UpstreamModel: upstreamModel,
 			ConvID:        convID, // 第 1 轮空串=新会话,后续轮复用
 			ParentMsgID:   parentID,

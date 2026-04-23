@@ -79,6 +79,13 @@ const (
 	AccountQuotaProbeIntervalSec = "account.quota_probe_interval_sec"
 	AccountDefaultClientID       = "account.default_client_id"
 
+	// 图片路由
+	ImageReverseOnly              = "image.reverse_only"
+	ImageNativeEnabled            = "image.native_enabled"
+	ImageResponsesFallbackEnabled = "image.responses_fallback_enabled"
+	ImageResponsesDirectEnabled   = "image.responses_direct_enabled"
+	ImageSafeMode                 = "image.safe_mode"
+
 	// 计费与充值
 	BillingCreditPerCNY         = "billing.credit_per_cny"
 	BillingNotifyAdminOnAdjust  = "billing.notify_admin_on_adjust"
@@ -147,6 +154,13 @@ var Defs = []KeyDef{
 	{Key: AccountQuotaProbeEnabled, Type: "bool", Category: "gateway", Default: "true", Label: "账号额度自动探测", Desc: "后台定期查询账号的图片剩余额度"},
 	{Key: AccountQuotaProbeIntervalSec, Type: "int", Category: "gateway", Default: "900", Label: "额度探测最小间隔(秒)", Desc: "同一账号两次探测之间的最小间隔,避免过度请求"},
 	{Key: AccountDefaultClientID, Type: "string", Category: "gateway", Default: "app_EMoamEEZ73f0CkXaXp7hrann", Label: "导入账号默认 client_id", Desc: "JSON 未指定时使用的 OAuth client_id"},
+
+	// ---------- 图片路由 ----------
+	{Key: ImageReverseOnly, Type: "bool", Category: "gateway", Default: "false", Label: "图片 reverse-only", Desc: "开启后所有图片请求仅走 reverse provider"},
+	{Key: ImageNativeEnabled, Type: "bool", Category: "gateway", Default: "true", Label: "启用 native 图片", Desc: "允许图片请求走原生 OpenAI Images provider"},
+	{Key: ImageResponsesFallbackEnabled, Type: "bool", Category: "gateway", Default: "true", Label: "启用 Responses 自动候选", Desc: "允许 Responses provider 参与自动图片路由"},
+	{Key: ImageResponsesDirectEnabled, Type: "bool", Category: "gateway", Default: "true", Label: "启用 Responses 直调接口", Desc: "允许 /v1/images/responses/* 接口"},
+	{Key: ImageSafeMode, Type: "bool", Category: "gateway", Default: "false", Label: "图片 safe mode", Desc: "开启后默认排除 reverse provider"},
 
 	// ---------- 计费与充值 ----------
 	{Key: BillingCreditPerCNY, Type: "int", Category: "billing", Default: "10000", Label: "1 元 = N 积分·厘", Desc: "展示用换算;默认 10000"},

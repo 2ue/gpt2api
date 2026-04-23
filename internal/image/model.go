@@ -41,25 +41,31 @@ const (
 
 // Task 对应 image_tasks 表。
 type Task struct {
-	ID              uint64    `db:"id"`
-	TaskID          string    `db:"task_id"` // 对外 id:img_xxx
-	UserID          uint64    `db:"user_id"`
-	KeyID           uint64    `db:"key_id"`
-	ModelID         uint64    `db:"model_id"`
-	AccountID       uint64    `db:"account_id"`
-	Prompt          string    `db:"prompt"`
-	N               int       `db:"n"`
-	Size            string    `db:"size"`
-	Status          string    `db:"status"`
-	ConversationID  string    `db:"conversation_id"`
-	FileIDs         []byte    `db:"file_ids"`    // JSON 数组字符串
-	ResultURLs      []byte    `db:"result_urls"` // JSON 数组字符串(签名 URL)
-	Error           string    `db:"error"`
-	EstimatedCredit int64     `db:"estimated_credit"`
-	CreditCost      int64     `db:"credit_cost"`
-	CreatedAt       time.Time `db:"created_at"`
-	StartedAt       *time.Time `db:"started_at"`
-	FinishedAt      *time.Time `db:"finished_at"`
+	ID                 uint64     `db:"id"`
+	TaskID             string     `db:"task_id"` // 对外 id:img_xxx
+	UserID             uint64     `db:"user_id"`
+	KeyID              uint64     `db:"key_id"`
+	ModelID            uint64     `db:"model_id"`
+	AccountID          uint64     `db:"account_id"`
+	Prompt             string     `db:"prompt"`
+	N                  int        `db:"n"`
+	Size               string     `db:"size"`
+	Operation          string     `db:"operation"`
+	ProviderKind       string     `db:"provider_kind"`
+	RoutePolicy        string     `db:"route_policy"`
+	RequestOptionsJSON []byte     `db:"request_options_json"`
+	AttemptCount       int        `db:"attempt_count"`
+	SwitchCount        int        `db:"switch_count"`
+	Status             string     `db:"status"`
+	ConversationID     string     `db:"conversation_id"`
+	FileIDs            []byte     `db:"file_ids"`    // JSON 数组字符串
+	ResultURLs         []byte     `db:"result_urls"` // JSON 数组字符串(签名 URL)
+	Error              string     `db:"error"`
+	EstimatedCredit    int64      `db:"estimated_credit"`
+	CreditCost         int64      `db:"credit_cost"`
+	CreatedAt          time.Time  `db:"created_at"`
+	StartedAt          *time.Time `db:"started_at"`
+	FinishedAt         *time.Time `db:"finished_at"`
 }
 
 // Result 是 Runner 返回给网关/客户端的生图结果。
@@ -77,6 +83,20 @@ type Result struct {
 type ResultImage struct {
 	URL         string `json:"url"`          // 上游签名直链(短期有效,通常 15 分钟)
 	FileID      string `json:"file_id"`      // chatgpt.com file-service id(纯 id,不含 sed:)
+	B64JSON     string `json:"b64_json,omitempty"`
 	IsSediment  bool   `json:"is_sediment,omitempty"`
 	ContentType string `json:"content_type,omitempty"`
+}
+
+// TaskOutput 对应 image_task_outputs 表。
+type TaskOutput struct {
+	ID            uint64    `db:"id"`
+	TaskID        string    `db:"task_id"`
+	OutputIndex   int       `db:"output_index"`
+	SourceType    string    `db:"source_type"`
+	SourceRef     string    `db:"source_ref"`
+	ContentType   string    `db:"content_type"`
+	RevisedPrompt string    `db:"revised_prompt"`
+	MetaJSON      []byte    `db:"meta_json"`
+	CreatedAt     time.Time `db:"created_at"`
 }

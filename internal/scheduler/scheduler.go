@@ -31,7 +31,10 @@ var ErrNoAvailable = errors.New("scheduler: no available account")
 // Lease 代表一次账号占用的租约。
 type Lease struct {
 	Account     *account.Account
+	ProviderKind string
 	AuthToken   string // 已解密
+	APIKey      string // 已解密
+	APIBaseURL  string
 	ProxyURL    string // 已带密码
 	ProxyID     uint64
 	DeviceID    string
@@ -39,6 +42,19 @@ type Lease struct {
 	lockKey     string
 	lockToken   string
 	releaseFunc func(context.Context) error
+}
+
+// DispatchSpec 图片调度输入。
+type DispatchSpec struct {
+	Operation          string
+	PreferredProvider  string
+	AllowedProviders   []string
+	PreferredAccountID uint64
+	ExcludedAccountIDs map[uint64]struct{}
+	NeedMaskSupport    bool
+	NeedNativeOptions  bool
+	NeedB64JSON        bool
+	NeedReferenceImages bool
 }
 
 // Release 释放锁并更新账号 last_used_at / today_used。
@@ -196,6 +212,54 @@ func (s *Scheduler) Dispatch(ctx context.Context, modelType string) (*Lease, err
 	}
 }
 
+// DispatchImage 为图片请求调度 provider-aware 账号。
+func (s *Scheduler) DispatchImage(ctx context.Context, spec DispatchSpec) (*Lease, error) {
+	deadline := time.Now().Add(s.queueWait())
+	const (
+		minBackoff = 200 * time.Millisecond
+		maxBackoff = 2 * time.Second
+	)
+	backoff := minBackoff
+	start := time.Now()
+	attempt := 0
+	for {
+		attempt++
+		lease, err := s.tryDispatchImageOnce(ctx, spec)
+		if err == nil {
+			if attempt > 1 {
+				logger.L().Info("scheduler queued image dispatch ok",
+					zap.Int("attempt", attempt),
+					zap.Duration("waited", time.Since(start)),
+					zap.Uint64("account_id", lease.Account.ID),
+					zap.String("provider_kind", lease.ProviderKind))
+			}
+			return lease, nil
+		}
+		if !errors.Is(err, ErrNoAvailable) {
+			return nil, err
+		}
+		if !time.Now().Before(deadline) {
+			return nil, ErrNoAvailable
+		}
+		wait := backoff
+		if remain := time.Until(deadline); remain < wait {
+			wait = remain
+		}
+		if wait <= 0 {
+			return nil, ErrNoAvailable
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+		backoff += backoff / 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
+}
+
 // tryDispatchOnce 扫一遍 candidate,尝试为其中一个加锁;
 // 全部 candidate 都被锁 / 不满足 min_interval / 日配额时返回 ErrNoAvailable。
 func (s *Scheduler) tryDispatchOnce(ctx context.Context, modelType string) (*Lease, error) {
@@ -240,6 +304,55 @@ func (s *Scheduler) tryDispatchOnce(ctx context.Context, modelType string) (*Lea
 	return nil, ErrNoAvailable
 }
 
+func (s *Scheduler) tryDispatchImageOnce(ctx context.Context, spec DispatchSpec) (*Lease, error) {
+	limit := 50
+	dao := s.accSvc.DAO()
+	providers := orderedProviders(spec)
+	candidates, err := dao.ListDispatchableByProviders(ctx, providers, limit)
+	if err != nil {
+		return nil, fmt.Errorf("scheduler image list: %w", err)
+	}
+	if len(candidates) == 0 {
+		return nil, ErrNoAvailable
+	}
+	now := time.Now()
+	minInterval := time.Duration(s.cfg.MinIntervalSec) * time.Second
+
+	for _, acc := range reorderImageCandidates(candidates, spec) {
+		if _, skip := spec.ExcludedAccountIDs[acc.ID]; skip {
+			continue
+		}
+		if !imageAccountEligible(acc, spec) {
+			continue
+		}
+		if acc.LastUsedAt.Valid && now.Sub(acc.LastUsedAt.Time) < minInterval {
+			continue
+		}
+		if acc.ProviderKind == account.ProviderKindReverse && acc.DailyImageQuota > 0 {
+			usedToday := 0
+			if acc.TodayUsedDate.Valid && sameDay(acc.TodayUsedDate.Time, now) {
+				usedToday = acc.TodayUsedCount
+			}
+			max := int(float64(acc.DailyImageQuota) * s.dailyUsageRatio())
+			if max > 0 && usedToday >= max {
+				continue
+			}
+		}
+		lease, err := s.tryLock(ctx, acc)
+		if err == nil {
+			return lease, nil
+		}
+		if errors.Is(err, lock.ErrNotAcquired) {
+			continue
+		}
+		logger.L().Warn("scheduler tryLock image error",
+			zap.Uint64("account_id", acc.ID),
+			zap.String("provider_kind", acc.ProviderKind),
+			zap.Error(err))
+	}
+	return nil, ErrNoAvailable
+}
+
 func (s *Scheduler) tryLock(ctx context.Context, acc *account.Account) (*Lease, error) {
 	key := fmt.Sprintf("acct:lock:%d", acc.ID)
 	token := uuid.NewString()
@@ -248,10 +361,22 @@ func (s *Scheduler) tryLock(ctx context.Context, acc *account.Account) (*Lease, 
 		return nil, err
 	}
 
-	authToken, err := s.accSvc.DecryptAuthToken(acc)
-	if err != nil {
-		_ = s.lock.Release(ctx, key, token)
-		return nil, fmt.Errorf("decrypt auth_token: %w", err)
+	var err error
+	var authToken string
+	if acc.ProviderKind == "" || acc.ProviderKind == account.ProviderKindReverse {
+		authToken, err = s.accSvc.DecryptAuthToken(acc)
+		if err != nil {
+			_ = s.lock.Release(ctx, key, token)
+			return nil, fmt.Errorf("decrypt auth_token: %w", err)
+		}
+	}
+	var apiKey string
+	if acc.ProviderKind != "" && acc.ProviderKind != account.ProviderKindReverse {
+		apiKey, err = s.accSvc.DecryptAPIKey(acc)
+		if err != nil {
+			_ = s.lock.Release(ctx, key, token)
+			return nil, fmt.Errorf("decrypt api_key: %w", err)
+		}
 	}
 
 	// 首次使用时为账号补发一个持久化的 oai_device_id(导入时常为空)。
@@ -296,14 +421,17 @@ func (s *Scheduler) tryLock(ctx context.Context, acc *account.Account) (*Lease, 
 
 	accCopy := acc
 	lease := &Lease{
-		Account:   accCopy,
-		AuthToken: authToken,
-		ProxyURL:  proxyURL,
-		ProxyID:   proxyID,
-		DeviceID:  deviceID,
-		SessionID: sessionID,
-		lockKey:   key,
-		lockToken: token,
+		Account:      accCopy,
+		ProviderKind: acc.ProviderKind,
+		AuthToken:    authToken,
+		APIKey:       apiKey,
+		APIBaseURL:   acc.APIBaseURL,
+		ProxyURL:     proxyURL,
+		ProxyID:      proxyID,
+		DeviceID:     deviceID,
+		SessionID:    sessionID,
+		lockKey:      key,
+		lockToken:    token,
 	}
 	lease.releaseFunc = func(c context.Context) error {
 		today := truncateDay(time.Now())
@@ -311,6 +439,106 @@ func (s *Scheduler) tryLock(ctx context.Context, acc *account.Account) (*Lease, 
 		return s.lock.Release(c, key, token)
 	}
 	return lease, nil
+}
+
+func orderedProviders(spec DispatchSpec) []string {
+	if len(spec.AllowedProviders) == 0 {
+		return []string{account.ProviderKindReverse}
+	}
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(spec.AllowedProviders))
+	if spec.PreferredProvider != "" {
+		out = append(out, spec.PreferredProvider)
+		seen[spec.PreferredProvider] = struct{}{}
+	}
+	for _, p := range spec.AllowedProviders {
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		out = append(out, p)
+		seen[p] = struct{}{}
+	}
+	return out
+}
+
+func reorderImageCandidates(in []*account.Account, spec DispatchSpec) []*account.Account {
+	if len(in) == 0 {
+		return in
+	}
+	if spec.PreferredAccountID == 0 && spec.PreferredProvider == "" {
+		return in
+	}
+	preferred := make([]*account.Account, 0, len(in))
+	rest := make([]*account.Account, 0, len(in))
+	for _, acc := range in {
+		if acc == nil {
+			continue
+		}
+		if spec.PreferredAccountID > 0 && acc.ID == spec.PreferredAccountID {
+			preferred = append(preferred, acc)
+			continue
+		}
+		if spec.PreferredProvider != "" && acc.ProviderKind == spec.PreferredProvider {
+			preferred = append(preferred, acc)
+			continue
+		}
+		rest = append(rest, acc)
+	}
+	return append(preferred, rest...)
+}
+
+func imageAccountEligible(acc *account.Account, spec DispatchSpec) bool {
+	if acc == nil {
+		return false
+	}
+	caps := acc.ImageCapabilityMap()
+	hasCap := func(name string, fallback bool) bool {
+		if len(caps) == 0 {
+			return fallback
+		}
+		v, ok := caps[name]
+		if !ok {
+			return fallback
+		}
+		return v
+	}
+	switch acc.ProviderKind {
+	case "", account.ProviderKindReverse:
+		if spec.NeedMaskSupport || spec.NeedNativeOptions || spec.NeedB64JSON {
+			return false
+		}
+		if spec.NeedReferenceImages && !hasCap("reference_images", true) {
+			return false
+		}
+		return hasCap("generate", true)
+	case account.ProviderKindNative:
+		if spec.NeedMaskSupport && !hasCap("mask_edit", true) {
+			return false
+		}
+		if spec.NeedB64JSON && !hasCap("b64_json", true) {
+			return false
+		}
+		if spec.NeedReferenceImages && !hasCap("reference_images", true) {
+			return false
+		}
+		if spec.NeedNativeOptions && !hasCap("native_options", true) {
+			return false
+		}
+		return hasCap("generate", true)
+	case account.ProviderKindResponses:
+		if spec.NeedMaskSupport || spec.NeedNativeOptions {
+			return false
+		}
+		if spec.NeedB64JSON && !hasCap("b64_json", true) {
+			return false
+		}
+		if spec.NeedReferenceImages && !hasCap("reference_images", true) {
+			return false
+		}
+		return hasCap("generate", true)
+	default:
+		return false
+	}
 }
 
 // MarkRateLimited 上游 429:标记账号冷却并降级状态。

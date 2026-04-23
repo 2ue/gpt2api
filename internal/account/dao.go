@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/jmoiron/sqlx"
@@ -25,6 +26,16 @@ func fill(a *Account) {
 	}
 	a.HasRT = a.RefreshTokenEnc.Valid && a.RefreshTokenEnc.String != ""
 	a.HasST = a.SessionTokenEnc.Valid && a.SessionTokenEnc.String != ""
+	a.HasAPIKey = a.APIKeyEnc.Valid && a.APIKeyEnc.String != ""
+	if a.ProviderKind == "" {
+		a.ProviderKind = ProviderKindReverse
+	}
+	if a.APIBaseURL == "" {
+		a.APIBaseURL = "https://api.openai.com/v1"
+	}
+	if a.SameAccountRetryLimit <= 0 {
+		a.SameAccountRetryLimit = 1
+	}
 }
 
 func fillAll(rows []*Account) {
@@ -34,14 +45,25 @@ func fillAll(rows []*Account) {
 }
 
 func (d *DAO) Create(ctx context.Context, a *Account) (uint64, error) {
+	if a.ProviderKind == "" {
+		a.ProviderKind = ProviderKindReverse
+	}
+	if a.APIBaseURL == "" {
+		a.APIBaseURL = "https://api.openai.com/v1"
+	}
+	if a.SameAccountRetryLimit <= 0 {
+		a.SameAccountRetryLimit = 1
+	}
 	res, err := d.db.ExecContext(ctx,
 		`INSERT INTO oai_accounts
-         (email, auth_token_enc, refresh_token_enc, session_token_enc, token_expires_at,
-          oai_session_id, oai_device_id, client_id, chatgpt_account_id, account_type,
+         (email, auth_token_enc, refresh_token_enc, session_token_enc, api_key_enc, token_expires_at,
+          oai_session_id, oai_device_id, client_id, api_base_url, image_capabilities_json,
+          same_account_retry_limit, priority, chatgpt_account_id, account_type, provider_kind,
           plan_type, daily_image_quota, status, notes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		a.Email, a.AuthTokenEnc, a.RefreshTokenEnc, a.SessionTokenEnc, a.TokenExpiresAt,
-		a.OAISessionID, a.OAIDeviceID, a.ClientID, a.ChatGPTAccountID, a.AccountType,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		a.Email, a.AuthTokenEnc, a.RefreshTokenEnc, a.SessionTokenEnc, a.APIKeyEnc, a.TokenExpiresAt,
+		a.OAISessionID, a.OAIDeviceID, a.ClientID, a.APIBaseURL, nullJSON(a.ImageCapabilities),
+		a.SameAccountRetryLimit, a.Priority, a.ChatGPTAccountID, a.AccountType, a.ProviderKind,
 		a.PlanType, a.DailyImageQuota, a.Status, a.Notes,
 	)
 	if err != nil {
@@ -112,10 +134,44 @@ func (d *DAO) ListDispatchable(ctx context.Context, limit int) ([]*Account, erro
 	err := d.db.SelectContext(ctx, &rows,
 		`SELECT * FROM oai_accounts
          WHERE deleted_at IS NULL AND status = 'healthy'
+           AND provider_kind = ?
            AND (cooldown_until IS NULL OR cooldown_until <= ?)
            AND (token_expires_at IS NULL OR token_expires_at > ?)
          ORDER BY CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END, last_used_at ASC
-         LIMIT ?`, now, now, limit)
+         LIMIT ?`, ProviderKindReverse, now, now, limit)
+	fillAll(rows)
+	return rows, err
+}
+
+// ListDispatchableByProviders 返回指定 provider_kind 候选,供图片调度使用。
+func (d *DAO) ListDispatchableByProviders(ctx context.Context, providerKinds []string, limit int) ([]*Account, error) {
+	rows := make([]*Account, 0, limit)
+	if len(providerKinds) == 0 {
+		return rows, nil
+	}
+	now := time.Now()
+	args := make([]interface{}, 0, len(providerKinds)+3)
+	qMarks := make([]string, 0, len(providerKinds))
+	for _, v := range providerKinds {
+		qMarks = append(qMarks, "?")
+		args = append(args, v)
+	}
+	args = append(args, now, now, limit)
+	query := `SELECT * FROM oai_accounts
+         WHERE deleted_at IS NULL AND status = 'healthy'
+           AND provider_kind IN (` + strings.Join(qMarks, ",") + `)
+           AND (cooldown_until IS NULL OR cooldown_until <= ?)
+           AND (
+                 (provider_kind = 'reverse' AND (token_expires_at IS NULL OR token_expires_at > ?))
+                 OR
+                 (provider_kind <> 'reverse')
+               )
+         ORDER BY priority DESC,
+                  CASE WHEN last_used_at IS NULL THEN 0 ELSE 1 END,
+                  last_used_at ASC,
+                  id ASC
+         LIMIT ?`
+	err := d.db.SelectContext(ctx, &rows, query, args...)
 	fillAll(rows)
 	return rows, err
 }
@@ -128,12 +184,13 @@ func (d *DAO) ListNeedRefresh(ctx context.Context, aheadSec int, limit int) ([]*
 	err := d.db.SelectContext(ctx, &rows,
 		`SELECT * FROM oai_accounts
          WHERE deleted_at IS NULL
+           AND provider_kind = ?
            AND status <> 'dead'
            AND (refresh_token_enc IS NOT NULL OR session_token_enc IS NOT NULL)
            AND token_expires_at IS NOT NULL
            AND token_expires_at <= ?
          ORDER BY token_expires_at ASC
-         LIMIT ?`, threshold, limit)
+         LIMIT ?`, ProviderKindReverse, threshold, limit)
 	fillAll(rows)
 	return rows, err
 }
@@ -145,12 +202,13 @@ func (d *DAO) ListNeedProbeQuota(ctx context.Context, minIntervalSec int, limit 
 	err := d.db.SelectContext(ctx, &rows,
 		`SELECT * FROM oai_accounts
          WHERE deleted_at IS NULL
+           AND provider_kind = ?
            AND status = 'healthy'
            AND (token_expires_at IS NULL OR token_expires_at > NOW())
            AND (image_quota_updated_at IS NULL OR image_quota_updated_at <= ?)
          ORDER BY CASE WHEN image_quota_updated_at IS NULL THEN 0 ELSE 1 END,
                   image_quota_updated_at ASC
-         LIMIT ?`, threshold, limit)
+         LIMIT ?`, ProviderKindReverse, threshold, limit)
 	fillAll(rows)
 	return rows, err
 }
@@ -164,15 +222,26 @@ func (d *DAO) ListAllActiveIDs(ctx context.Context) ([]uint64, error) {
 }
 
 func (d *DAO) Update(ctx context.Context, a *Account) error {
+	if a.ProviderKind == "" {
+		a.ProviderKind = ProviderKindReverse
+	}
+	if a.APIBaseURL == "" {
+		a.APIBaseURL = "https://api.openai.com/v1"
+	}
+	if a.SameAccountRetryLimit <= 0 {
+		a.SameAccountRetryLimit = 1
+	}
 	_, err := d.db.ExecContext(ctx,
 		`UPDATE oai_accounts
-         SET email=?, auth_token_enc=?, refresh_token_enc=?, session_token_enc=?, token_expires_at=?,
-             oai_session_id=?, oai_device_id=?, client_id=?, chatgpt_account_id=?, account_type=?,
+         SET email=?, auth_token_enc=?, refresh_token_enc=?, session_token_enc=?, api_key_enc=?, token_expires_at=?,
+             oai_session_id=?, oai_device_id=?, client_id=?, api_base_url=?, image_capabilities_json=?,
+             same_account_retry_limit=?, priority=?, chatgpt_account_id=?, account_type=?, provider_kind=?,
              plan_type=?, daily_image_quota=?,
              status=?, notes=?
          WHERE id = ? AND deleted_at IS NULL`,
-		a.Email, a.AuthTokenEnc, a.RefreshTokenEnc, a.SessionTokenEnc, a.TokenExpiresAt,
-		a.OAISessionID, a.OAIDeviceID, a.ClientID, a.ChatGPTAccountID, a.AccountType,
+		a.Email, a.AuthTokenEnc, a.RefreshTokenEnc, a.SessionTokenEnc, a.APIKeyEnc, a.TokenExpiresAt,
+		a.OAISessionID, a.OAIDeviceID, a.ClientID, a.APIBaseURL, nullJSON(a.ImageCapabilities),
+		a.SameAccountRetryLimit, a.Priority, a.ChatGPTAccountID, a.AccountType, a.ProviderKind,
 		a.PlanType, a.DailyImageQuota,
 		a.Status, a.Notes, a.ID,
 	)
@@ -392,4 +461,11 @@ func (d *DAO) GetBinding(ctx context.Context, accountID uint64) (*Binding, error
 		return nil, nil
 	}
 	return &b, err
+}
+
+func nullJSON(v []byte) interface{} {
+	if len(v) == 0 {
+		return nil
+	}
+	return v
 }

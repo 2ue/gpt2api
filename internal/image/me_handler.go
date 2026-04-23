@@ -1,6 +1,7 @@
 package image
 
 import (
+	"context"
 	"errors"
 	"strconv"
 	"strings"
@@ -22,30 +23,38 @@ func NewMeHandler(dao *DAO) *MeHandler { return &MeHandler{dao: dao} }
 
 // taskView 是对外返回的视图结构,解码 JSON 列 + 隐藏内部字段。
 type taskView struct {
-	ID             uint64    `json:"id"`
-	TaskID         string    `json:"task_id"`
-	UserID         uint64    `json:"user_id"`
-	ModelID        uint64    `json:"model_id"`
-	AccountID      uint64    `json:"account_id"`
-	Prompt         string    `json:"prompt"`
-	N              int       `json:"n"`
-	Size           string    `json:"size"`
-	Status         string    `json:"status"`
-	ConversationID string    `json:"conversation_id,omitempty"`
-	Error          string    `json:"error,omitempty"`
-	CreditCost     int64     `json:"credit_cost"`
-	ImageURLs      []string  `json:"image_urls"`
-	FileIDs        []string  `json:"file_ids,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID             uint64     `json:"id"`
+	TaskID         string     `json:"task_id"`
+	UserID         uint64     `json:"user_id"`
+	ModelID        uint64     `json:"model_id"`
+	AccountID      uint64     `json:"account_id"`
+	Prompt         string     `json:"prompt"`
+	N              int        `json:"n"`
+	Size           string     `json:"size"`
+	Status         string     `json:"status"`
+	ConversationID string     `json:"conversation_id,omitempty"`
+	Error          string     `json:"error,omitempty"`
+	CreditCost     int64      `json:"credit_cost"`
+	ImageURLs      []string   `json:"image_urls"`
+	FileIDs        []string   `json:"file_ids,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
 	StartedAt      *time.Time `json:"started_at,omitempty"`
 	FinishedAt     *time.Time `json:"finished_at,omitempty"`
 }
 
-func toView(t *Task) taskView {
-	urls := t.DecodeResultURLs()
+func (h *MeHandler) toView(ctx context.Context, t *Task) taskView {
+	urls := []string(nil)
+	if h != nil && h.dao != nil {
+		if outputs, err := h.dao.ListOutputs(ctx, t.TaskID); err == nil && len(outputs) > 0 {
+			urls = BuildTaskImageProxyURLs(t.TaskID, outputs, nil, nil, ImageProxyTTL)
+		}
+	}
 	fids := t.DecodeFileIDs()
 	for i, id := range fids {
 		fids[i] = strings.TrimPrefix(id, "sed:")
+	}
+	if len(urls) == 0 {
+		urls = BuildTaskImageProxyURLs(t.TaskID, nil, fids, t.DecodeResultURLs(), ImageProxyTTL)
 	}
 	return taskView{
 		ID: t.ID, TaskID: t.TaskID, UserID: t.UserID, ModelID: t.ModelID,
@@ -82,7 +91,7 @@ func (h *MeHandler) List(c *gin.Context) {
 	}
 	items := make([]taskView, 0, len(tasks))
 	for i := range tasks {
-		items = append(items, toView(&tasks[i]))
+		items = append(items, h.toView(c.Request.Context(), &tasks[i]))
 	}
 	resp.OK(c, gin.H{"items": items, "limit": limit, "offset": offset})
 }
@@ -112,5 +121,5 @@ func (h *MeHandler) Get(c *gin.Context) {
 		resp.Fail(c, 40400, "task not found")
 		return
 	}
-	resp.OK(c, toView(t))
+	resp.OK(c, h.toView(c.Request.Context(), t))
 }

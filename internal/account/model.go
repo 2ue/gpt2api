@@ -2,6 +2,7 @@ package account
 
 import (
 	"database/sql"
+	"encoding/json"
 	"time"
 )
 
@@ -21,6 +22,13 @@ const (
 	RefreshSourceManual = "manual"
 )
 
+// 图片 provider 类型。
+const (
+	ProviderKindReverse   = "reverse"
+	ProviderKindNative    = "native"
+	ProviderKindResponses = "responses_tool"
+)
+
 // Account 对应 oai_accounts 表。
 type Account struct {
 	ID                uint64         `db:"id" json:"id"`
@@ -28,10 +36,16 @@ type Account struct {
 	AuthTokenEnc      string         `db:"auth_token_enc" json:"-"`
 	RefreshTokenEnc   sql.NullString `db:"refresh_token_enc" json:"-"`
 	SessionTokenEnc   sql.NullString `db:"session_token_enc" json:"-"`
+	APIKeyEnc         sql.NullString `db:"api_key_enc" json:"-"`
 	TokenExpiresAt    sql.NullTime   `db:"token_expires_at" json:"token_expires_at,omitempty"`
 	OAISessionID      string         `db:"oai_session_id" json:"oai_session_id"`
 	OAIDeviceID       string         `db:"oai_device_id" json:"oai_device_id"`
 	ClientID          string         `db:"client_id" json:"client_id"`
+	APIBaseURL        string         `db:"api_base_url" json:"api_base_url"`
+	ProviderKind      string         `db:"provider_kind" json:"provider_kind"`
+	ImageCapabilities []byte         `db:"image_capabilities_json" json:"image_capabilities_json,omitempty"`
+	SameAccountRetryLimit int        `db:"same_account_retry_limit" json:"same_account_retry_limit"`
+	Priority          int            `db:"priority" json:"priority"`
 	ChatGPTAccountID  string         `db:"chatgpt_account_id" json:"chatgpt_account_id"`
 	AccountType       string         `db:"account_type" json:"account_type"`
 	PlanType          string         `db:"plan_type" json:"plan_type"`
@@ -60,6 +74,17 @@ type Account struct {
 	// 辅助字段(非数据库列):前端展示用标志位。
 	HasRT bool `db:"-" json:"has_rt"`
 	HasST bool `db:"-" json:"has_st"`
+	HasAPIKey bool `db:"-" json:"has_api_key"`
+}
+
+// ImageCapabilityMap 解出 capability flags。
+func (a *Account) ImageCapabilityMap() map[string]bool {
+	if a == nil || len(a.ImageCapabilities) == 0 {
+		return nil
+	}
+	out := map[string]bool{}
+	_ = json.Unmarshal(a.ImageCapabilities, &out)
+	return out
 }
 
 // Binding 对应 account_proxy_bindings 表。
