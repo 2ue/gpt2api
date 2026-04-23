@@ -52,7 +52,7 @@ services:
       retries: 10
 
   server:
-    image: ${SERVER_IMAGE:-docker.io/huby11111/gpt2api:0.0.3}
+    image: ${SERVER_IMAGE:-docker.io/huby11111/gpt2api:0.0.4}
     pull_policy: always
     restart: unless-stopped
     depends_on:
