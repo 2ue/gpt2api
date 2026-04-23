@@ -19,7 +19,7 @@
 | KEY 粒度 | 全特性:额度、过期、模型白名单、IP 白名单、RPM/TPM、分组倍率                                                          |
 | 角色模型   | 两级:普通用户 / 超级管理员                                                                              |
 | 支付     | 易支付聚合(微信 + 支付宝)                                                                              |
-| 后端     | Go 1.22+ / Gin / sqlx / MySQL 8.0 / Redis 7                                                  |
+| 后端     | Go 1.26+ / Gin / sqlx / MySQL 8.0 / Redis 7                                                  |
 | 前端     | Vue 3 / Element Plus / ECharts / UnoCSS                                                      |
 
 
@@ -698,4 +698,3 @@ html.dark {
 6. **日志**:结构化日志(zap),关键字段 `request_id`、`user_id`、`key_id`、`account_id`、`model_id`。
 7. **前端**:严格遵循 §8 界面规范与 §8.6 规范性约束,code review 以此为准。
 8. **上线前必过冒烟 + 压测**:§11.6 + `[RISK_AND_SAAS.md](../RISK_AND_SAAS.md)` §7。
-

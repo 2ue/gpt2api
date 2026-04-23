@@ -21,9 +21,30 @@
 
 ## 快速开始
 
+### 使用已发布镜像
+
+如果你已经通过 GitHub Actions 发布了镜像,可以直接复用这份 compose:
+
+```bash
+cd deploy
+cp .env.example .env
+
+# 例如使用 GHCR
+export SERVER_IMAGE=ghcr.io/<你的 GitHub 用户名>/gpt2api:latest
+
+docker compose pull server
+docker compose up -d
+```
+
+说明:
+
+- `server` 默认仍保留 `build` 配置,方便本地二次开发;
+- 线上拉已发布镜像时,通过 `SERVER_IMAGE` 覆盖镜像名即可;
+- 容器默认读取 `/app/configs/config.example.yaml`,再由 `GPT2API_*` 环境变量覆盖生产配置。
+
 ### 0. 宿主机准备
 
-需要提前装好:**Go 1.22+**、**Node 18+ / 20 LTS**、**Docker 24+**、**docker compose v2**。
+需要提前装好:**Go 1.26+**、**Node 18+ / 20 LTS**、**Docker 24+**、**docker compose v2**。
 
 > 建议配镜像加速:  
 > `go env -w GOPROXY=https://goproxy.cn,direct`  
@@ -147,4 +168,3 @@ docker compose exec server mysqldump -hmysql -ugpt2api -p \
 - `server` 可直接 `docker compose up -d --scale server=3`(需前面加 nginx/traefik)
 - `backups` 卷改成共享存储(NFS / S3 fuse),否则每个副本只能看到自己创建的备份
 - Redis 分布式锁已天然支持多副本,MySQL 和 JWT 密钥需统一
-

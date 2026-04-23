@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/432539/gpt2api/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/432539/gpt2api?style=flat-square"></a>
   <a href="https://github.com/432539/gpt2api/releases"><img alt="release" src="https://img.shields.io/github/v/release/432539/gpt2api?style=flat-square"></a>
-  <a href="https://golang.org/"><img alt="go" src="https://img.shields.io/badge/Go-1.22%2B-00ADD8?style=flat-square&logo=go"></a>
+  <a href="https://golang.org/"><img alt="go" src="https://img.shields.io/badge/Go-1.26%2B-00ADD8?style=flat-square&logo=go"></a>
   <a href="https://vuejs.org/"><img alt="vue" src="https://img.shields.io/badge/Vue-3-4FC08D?style=flat-square&logo=vue.js"></a>
   <a href="https://github.com/432539/gpt2api/blob/main/LICENSE"><img alt="license" src="https://img.shields.io/badge/License-MIT-green?style=flat-square"></a>
 </p>
@@ -103,7 +103,7 @@
 
 **后端**
 
-- Go 1.22+
+- Go 1.26+
 - Gin(HTTP 框架) / sqlx(MySQL 访问) / Viper(配置) / Zap(日志)
 - MySQL 8.0(业务数据 + 审计 + 账变) / Redis 7(分布式锁 / 限流 / 缓存)
 - `refraction-networking/utls`(TLS 指纹,用于规避 `chatgpt.com` JA3 检测)
@@ -199,7 +199,7 @@ flowchart LR
 
 | 软件 | 最低版本 | 用途 |
 |------|---------|------|
-| **Go** | 1.22+ | 交叉编译 `gpt2api` + `goose` 二进制 |
+| **Go** | 1.26+ | 交叉编译 `gpt2api` + `goose` 二进制 |
 | **Node.js** | 18+(推荐 20 LTS)| 编译前端 Vite 产物 |
 | **Docker** | 24+ | 构建 + 运行镜像 |
 | **docker compose** | v2 插件 | 启动 mysql / redis / server 编排 |

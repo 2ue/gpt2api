@@ -44,4 +44,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://localhost:8080/healthz || exit 1
 
 ENTRYPOINT ["/app/entrypoint.sh"]
-CMD ["/app/gpt2api", "-c", "/app/configs/config.yaml"]
+CMD ["/app/gpt2api", "-c", "/app/configs/config.example.yaml"]

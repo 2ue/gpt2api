@@ -47,7 +47,7 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
-    image: gpt2api/server:latest
+    image: ${SERVER_IMAGE:-gpt2api/server:latest}
     container_name: gpt2api-server
     restart: unless-stopped
     depends_on:
@@ -84,7 +84,7 @@ services:
       - ../configs:/app/configs:ro
       - backups:/app/data/backups
       - ./logs:/app/logs
-    command: ["/app/gpt2api", "-c", "/app/configs/config.yaml"]
+    command: ["/app/gpt2api", "-c", "/app/configs/config.example.yaml"]
 
 volumes:
   mysql_data:
