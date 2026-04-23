@@ -421,14 +421,15 @@ async function onProbeAll() {
 }
 
 // ========== 批量导入(多文件 + 分批) ==========
-// 4 种模式:
-//   - json: 文件/JSON 文本,原有行为
+// 5 种模式:
+//   - sub2api: 手动导出的 sub2api JSON
+//   - json:  token_*.json / JSONL
 //   - at:   一行一个 access_token
 //   - rt:   一行一个 refresh_token,必须提供 APPID(client_id)
 //   - st:   一行一个 session_token
-type ImportMode = 'json' | 'at' | 'rt' | 'st'
+type ImportMode = 'sub2api' | 'json' | 'at' | 'rt' | 'st'
 const importDlg = ref(false)
-const importMode = ref<ImportMode>('json')
+const importMode = ref<ImportMode>('sub2api')
 const importForm = reactive({
   files: [] as File[],
   text: '',
@@ -449,9 +450,20 @@ const importProgress = reactive({
 })
 const importResult = ref<accountApi.ImportSummary | null>(null)
 const importLastErrors = ref<accountApi.ImportLineResult[]>([])
+const isJSONImportMode = computed(() => importMode.value === 'sub2api' || importMode.value === 'json')
+const importModeLabel = computed(() => {
+  switch (importMode.value) {
+    case 'sub2api':
+      return 'sub2api'
+    case 'json':
+      return 'JSON'
+    default:
+      return importMode.value.toUpperCase()
+  }
+})
 
 function openImport() {
-  importMode.value = 'json'
+  importMode.value = 'sub2api'
   importForm.files = []
   importForm.text = ''
   importForm.tokens_text = ''
@@ -472,7 +484,7 @@ function openImport() {
 
 // 当前 tokens 模式下,每行 token 的数量预览
 const tokenLineCount = computed(() => {
-  if (importMode.value === 'json') return 0
+  if (isJSONImportMode.value) return 0
   return importForm.tokens_text
     .split(/\r?\n/)
     .map((s) => s.trim())
@@ -516,13 +528,28 @@ function humanSize(n: number) {
 const BATCH_FILES = 200
 const BATCH_BYTES = 8 * 1024 * 1024 // 8MB
 
+function buildImportDoneMessage(modeLabel: string, result: accountApi.ImportSummary) {
+  return `${modeLabel} 导入完成:+${result.created} / ~${result.updated} / 跳过${result.skipped} / 失败${result.failed}`
+}
+
+function hasImportProblems(result: accountApi.ImportSummary) {
+  return result.failed > 0 || result.skipped > 0
+}
+
 async function doImport() {
   importLastErrors.value = []
   importResult.value = null
+  importProgress.current = 0
+  importProgress.totalBatches = 0
+  importProgress.created = 0
+  importProgress.updated = 0
+  importProgress.skipped = 0
+  importProgress.failed = 0
+  const modeLabel = importModeLabel.value
 
   // 情况 0:AT/RT/ST 纯 token 模式
-  if (importMode.value !== 'json') {
-    const mode = importMode.value
+  if (!isJSONImportMode.value) {
+    const mode = importMode.value as accountApi.ImportTokensBody['mode']
     const tokens = importForm.tokens_text
       .split(/\r?\n/)
       .map((s) => s.trim())
@@ -563,12 +590,16 @@ async function doImport() {
       importLastErrors.value = r.results
         .filter((x) => x.status === 'failed' || x.status === 'skipped')
         .slice(0, 200)
-      const tip = `${mode.toUpperCase()} 导入完成:+${r.created} / ~${r.updated} / 跳过${r.skipped} / 失败${r.failed}`
-      if (r.failed > 0) ElNotification.warning({ title: '批量导入完成(部分失败)', message: tip })
-      else ElMessage.success(tip)
+      const tip = buildImportDoneMessage(modeLabel, r)
+      if (hasImportProblems(r)) {
+        ElNotification.warning({ title: '批量导入完成(部分失败)', message: tip })
+      } else {
+        ElMessage.success(tip)
+      }
     } catch (e: any) {
       ElMessage.error(e?.message || '导入失败')
     } finally {
+      importProgress.current = importProgress.totalBatches
       importing.value = false
       importProgress.running = false
       fetchList()
@@ -578,7 +609,14 @@ async function doImport() {
 
   // 情况一:纯文本导入(JSON 模式)
   if (importForm.files.length === 0) {
-    if (!importForm.text.trim()) { ElMessage.warning('请选择 JSON 文件或粘贴 JSON 文本'); return }
+    if (!importForm.text.trim()) {
+      ElMessage.warning(
+        importMode.value === 'sub2api'
+          ? '请选择 sub2api 导出文件或粘贴导出 JSON'
+          : '请选择 Token JSON 文件或粘贴 JSON 文本',
+      )
+      return
+    }
     importing.value = true
     importProgress.running = true
     importProgress.current = 0
@@ -593,10 +631,16 @@ async function doImport() {
       mergeSummary(r)
       importResult.value = cloneAgg()
       importLastErrors.value = r.results.filter((x) => x.status === 'failed' || x.status === 'skipped').slice(0, 200)
-      ElMessage.success(`导入完成:+${r.created} / ~${r.updated} / 跳过${r.skipped} / 失败${r.failed}`)
+      const tip = buildImportDoneMessage(modeLabel, r)
+      if (hasImportProblems(r)) {
+        ElNotification.warning({ title: '导入完成(部分失败)', message: tip, duration: 5000 })
+      } else {
+        ElMessage.success(tip)
+      }
     } catch (e: any) {
       ElMessage.error(e?.message || '导入失败')
     } finally {
+      importProgress.current = importProgress.totalBatches
       importing.value = false
       importProgress.running = false
       fetchList()
@@ -654,9 +698,11 @@ async function doImport() {
     }
     importResult.value = cloneAgg()
     importLastErrors.value = errList
-    ElNotification.success({
-      title: '批量导入完成',
-      message: `+${importProgress.created}  ~${importProgress.updated}  跳过 ${importProgress.skipped}  失败 ${importProgress.failed}`,
+    const outcome = cloneAgg()
+    const notificationType = hasImportProblems(outcome) ? ElNotification.warning : ElNotification.success
+    notificationType({
+      title: `${modeLabel} 批量导入完成`,
+      message: `+${outcome.created}  ~${outcome.updated}  跳过 ${outcome.skipped}  失败 ${outcome.failed}`,
       duration: 5000,
     })
   } finally {
@@ -698,7 +744,7 @@ onMounted(() => {
         <div class="hdr-left">
           <h2 class="page-title">GPT 账号池</h2>
           <div class="page-sub">
-            统一管理 ChatGPT Plus / Team / Codex 账号:JSON / AT / RT / ST 批量导入 · 自动刷新 · 图片额度探测 · 风控熔断轮转
+            统一管理 ChatGPT Plus / Team / Codex 账号:sub2api 导出 / Token JSON / AT / RT / ST 批量导入 · 自动刷新 · 图片额度探测 · 风控熔断轮转
           </div>
         </div>
         <div class="actions">
@@ -1071,16 +1117,22 @@ onMounted(() => {
     <el-dialog v-model="importDlg" title="批量导入账号" width="760px" destroy-on-close>
       <!-- 模式 tab -->
       <el-tabs v-model="importMode" class="import-tabs">
-        <el-tab-pane label="JSON 文件" name="json" />
-        <el-tab-pane label="Access Token" name="at" />
-        <el-tab-pane label="Refresh Token" name="rt" />
-        <el-tab-pane label="Session Token" name="st" />
+        <el-tab-pane label="sub2api 导出" name="sub2api" :disabled="importing" />
+        <el-tab-pane label="Token JSON" name="json" :disabled="importing" />
+        <el-tab-pane label="Access Token" name="at" :disabled="importing" />
+        <el-tab-pane label="Refresh Token" name="rt" :disabled="importing" />
+        <el-tab-pane label="Session Token" name="st" :disabled="importing" />
       </el-tabs>
 
-      <!-- JSON 模式 -->
-      <template v-if="importMode === 'json'">
-        <div class="tip">
-          支持两种 JSON:<b>sub2api-account-*.json</b>(多账号)与 <b>token_*.json</b>(单账号)。
+      <!-- JSON / sub2api 文件模式 -->
+      <template v-if="isJSONImportMode">
+        <div v-if="importMode === 'sub2api'" class="tip">
+          支持 <b>sub2api-account-*.json</b> 导出文件。可一次选择多个文件,前端会按每批
+          {{ BATCH_FILES }} 个文件 / {{ humanSize(BATCH_BYTES) }} 自动分批上传,不会卡页面。
+          不支持导入的账号会在结果中以 <code>skipped</code> 展示原因。
+        </div>
+        <div v-else class="tip">
+          支持 <b>token_*.json</b>(单账号),也支持多个 token JSON 直接换行拼接成 <code>JSONL</code>。
           可一次选择多个文件,前端会按每批 {{ BATCH_FILES }} 个文件 / {{ humanSize(BATCH_BYTES) }} 自动分批上传,不会卡页面。
         </div>
 
@@ -1117,11 +1169,15 @@ onMounted(() => {
           </div>
         </div>
 
-        <el-divider content-position="left">或粘贴 JSON 文本</el-divider>
+        <el-divider content-position="left">
+          {{ importMode === 'sub2api' ? '或粘贴 sub2api 导出 JSON' : '或粘贴 Token JSON 文本' }}
+        </el-divider>
         <el-input
           v-model="importForm.text"
           type="textarea" :rows="5"
-          placeholder="粘贴 sub2api 或 token_*.json 内容,多个 JSON 可以直接换行拼接(JSONL)"
+          :placeholder="importMode === 'sub2api'
+            ? '粘贴 sub2api 导出的 JSON 内容,可直接粘贴整个 accounts 导出文件'
+            : '粘贴 token_*.json 内容,多个 JSON 可以直接换行拼接(JSONL)'"
           spellcheck="false"
         />
       </template>
@@ -1177,12 +1233,14 @@ onMounted(() => {
         <el-checkbox v-model="importForm.update_existing">邮箱已存在则更新 token</el-checkbox>
         <div>
           <span class="muted" style="margin-right: 6px">
-            {{ importMode === 'rt' ? 'APPID(client_id,必填)' : 'client_id' }}
+            {{ importMode === 'rt' ? 'APPID(client_id,必填)' : (isJSONImportMode ? '默认 client_id' : 'client_id') }}
           </span>
           <el-input
             v-model="importForm.default_client_id"
             size="small" style="width: 280px"
-            :placeholder="importMode === 'rt' ? 'app_xxxxxxxxxxxxxxxxxxxxxxxx(必填)' : '可选,默认 ChatGPT iOS'"
+            :placeholder="importMode === 'rt'
+              ? 'app_xxxxxxxxxxxxxxxxxxxxxxxx(必填)'
+              : (importMode === 'sub2api' ? '导出里缺失时补填,默认 ChatGPT iOS' : '可选,默认 ChatGPT iOS')"
           />
         </div>
         <div>
@@ -1240,11 +1298,11 @@ onMounted(() => {
         <el-button :disabled="importing" @click="importDlg = false">关闭</el-button>
         <el-button type="primary" :loading="importing" @click="doImport">
           开始导入
-          <span v-if="importMode === 'json' && importForm.files.length > 0">
+          <span v-if="isJSONImportMode && importForm.files.length > 0">
             ({{ importForm.files.length }} 个文件)
           </span>
-          <span v-else-if="importMode !== 'json' && tokenLineCount > 0">
-            ({{ tokenLineCount }} 条 {{ importMode.toUpperCase() }})
+          <span v-else-if="!isJSONImportMode && tokenLineCount > 0">
+            ({{ tokenLineCount }} 条 {{ importModeLabel }})
           </span>
         </el-button>
       </template>

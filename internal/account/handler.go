@@ -303,7 +303,7 @@ func (h *Handler) Import(c *gin.Context) {
 		return
 	}
 
-	items, err := ParseJSONBlob(req.Text)
+	parsed, err := ParseJSONBlobDetailed(req.Text)
 	if err != nil {
 		resp.BadRequest(c, "解析失败:"+err.Error())
 		return
@@ -320,7 +320,8 @@ func (h *Handler) Import(c *gin.Context) {
 		DefaultProxyID:  req.DefaultProxyID,
 		BatchSize:       200,
 	}
-	summary := h.svc.ImportBatch(c.Request.Context(), items, opt)
+	summary := h.svc.ImportBatch(c.Request.Context(), parsed.Sources, opt)
+	summary = mergeImportSummaryWithSkipped(summary, parsed.Skipped)
 
 	// 后台踢一次刷新(让新导入的账号尽快探测过期时间 / 额度)
 	if h.refresher != nil {
