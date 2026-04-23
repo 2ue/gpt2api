@@ -3,11 +3,13 @@ package recharge
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
 
+	"github.com/jmoiron/sqlx"
 	"go.uber.org/zap"
 
 	"github.com/432539/gpt2api/internal/billing"
@@ -19,13 +21,13 @@ import (
 )
 
 var (
-	ErrPackageUnavailable  = errors.New("recharge: package not available")
-	ErrChannelDisabled     = errors.New("recharge: pay channel disabled")
-	ErrOrderNotFound       = errors.New("recharge: order not found")
-	ErrOrderStateInvalid   = errors.New("recharge: order state invalid")
-	ErrRechargeDisabled    = errors.New("recharge: recharge is disabled by admin")
-	ErrAmountOutOfRange    = errors.New("recharge: amount out of allowed range")
-	ErrDailyLimitExceeded  = errors.New("recharge: daily limit exceeded")
+	ErrPackageUnavailable = errors.New("recharge: package not available")
+	ErrChannelDisabled    = errors.New("recharge: pay channel disabled")
+	ErrOrderNotFound      = errors.New("recharge: order not found")
+	ErrOrderStateInvalid  = errors.New("recharge: order state invalid")
+	ErrRechargeDisabled   = errors.New("recharge: recharge is disabled by admin")
+	ErrAmountOutOfRange   = errors.New("recharge: amount out of allowed range")
+	ErrDailyLimitExceeded = errors.New("recharge: daily limit exceeded")
 )
 
 // Service 协调下单、回调入账、查询。
@@ -145,15 +147,6 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Order, error) {
 		if max := s.settings.RechargeMaxCNY(); max > 0 && price > max {
 			return nil, ErrAmountOutOfRange
 		}
-		if cap := s.settings.RechargeDailyLimitCNY(); cap > 0 {
-			already, err := s.dao.SumPaidTodayCNY(ctx, in.UserID)
-			if err != nil {
-				return nil, err
-			}
-			if already+price > cap {
-				return nil, ErrDailyLimitExceeded
-			}
-		}
 	}
 
 	outTradeNo := genTradeNo()
@@ -183,7 +176,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Order, error) {
 		ClientIP:   in.ClientIP,
 		Remark:     pkg.Name,
 	}
-	if _, err := s.dao.CreateOrder(ctx, o); err != nil {
+	if err := s.insertOrder(ctx, o); err != nil {
 		return nil, err
 	}
 	return o, nil
@@ -211,9 +204,9 @@ func (s *Service) CancelByUser(ctx context.Context, userID, orderID uint64) erro
 // ---------- 回调入账 ----------
 
 // HandleNotify 异步回调处理。返回 (上游期望文本, error)。
-//  - 上游期望文本:按 epay 规范,无论"成功/已处理"都必须回 "success";
-//    只有完全没处理 / 有异常时才允许回其它内容,以触发上游重发。
-//  - 我们出于幂等,收到一笔**已入账**的订单再次回调,也回 "success"。
+//   - 上游期望文本:按 epay 规范,无论"成功/已处理"都必须回 "success";
+//     只有完全没处理 / 有异常时才允许回其它内容,以触发上游重发。
+//   - 我们出于幂等,收到一笔**已入账**的订单再次回调,也回 "success"。
 func (s *Service) HandleNotify(ctx context.Context, form url.Values) (string, error) {
 	pl, err := s.signer.ParseNotify(form)
 	if err != nil {
@@ -255,40 +248,56 @@ func (s *Service) HandleNotify(ctx context.Context, form url.Values) (string, er
 	return "success", nil
 }
 
-// settle 单次入账:更新订单为 paid + billing.Recharge 增加积分。
-// 这里用两段式:先在 recharge 事务内把订单 CAS 成 paid,再调用 billing。
-// billing 内部自己开事务,两段失败时会在日志里留痕(极罕见,需要人工对账)。
+// settle 单次入账:在同一个事务里更新订单为 paid 并增加积分。
+// 对于支付平台已经确认成功的回调,即使订单先被取消/过期,也要继续入账以避免吞单。
 func (s *Service) settle(ctx context.Context, o *Order, pl *epay.NotifyPayload) error {
-	// CAS: pending -> paid,避免双发回调重复入账
-	res, err := s.dao.DB().ExecContext(ctx,
-		`UPDATE recharge_orders
-           SET status = ?, trade_no = ?, pay_method = ?, paid_at = NOW(),
-               notify_raw = ?
-         WHERE id = ? AND status = ?`,
-		StatusPaid, pl.TradeNo, pl.Type, rawDump(pl.Raw), o.ID, StatusPending)
+	tx, err := s.dao.DB().BeginTxx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	n, _ := res.RowsAffected()
-	if n == 0 {
-		// 并发下已被另一条回调处理过
+	defer func() { _ = tx.Rollback() }()
+
+	locked, err := loadOrderForUpdate(ctx, tx, o.ID)
+	if err != nil {
+		return err
+	}
+	if locked.Status == StatusPaid {
 		return nil
 	}
+	if !notifyPayableStatus(locked.Status) {
+		return ErrOrderStateInvalid
+	}
 
-	refID := fmt.Sprintf("order:%s", o.OutTradeNo)
-	remark := fmt.Sprintf("充值:%s", o.Remark)
-	total := o.TotalCredits()
-	if err := s.billing.Recharge(ctx, o.UserID, total, refID, remark); err != nil {
-		// 钱到了但积分没加 —— 回滚到 pending 等待人工介入
-		s.log.Error("BILLING FAILED AFTER PAID, needs manual intervention",
-			zap.String("out_trade_no", o.OutTradeNo), zap.Error(err))
+	latePaid := locked.Status != StatusPending
+	paidAt := nowUTC()
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE recharge_orders
+           SET status = ?, trade_no = ?, pay_method = ?, paid_at = ?, notify_raw = ?
+         WHERE id = ?`,
+		StatusPaid, pl.TradeNo, pl.Type, paidAt, rawDump(pl.Raw), locked.ID); err != nil {
 		return err
+	}
+
+	refID := fmt.Sprintf("order:%s", locked.OutTradeNo)
+	remark := fmt.Sprintf("充值:%s", locked.Remark)
+	if err := s.billing.RechargeTx(ctx, tx, locked.UserID, locked.TotalCredits(), refID, remark); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	if latePaid {
+		s.log.Warn("late paid order settled after local status changed",
+			zap.String("out_trade_no", locked.OutTradeNo),
+			zap.String("from_status", locked.Status),
+			zap.String("trade_no", pl.TradeNo))
 	}
 
 	// 异步邮件通知(失败不影响主流程)
 	if s.mail != nil && !s.mail.Disabled() {
-		if u, err := s.users.GetByID(ctx, o.UserID); err == nil && u.Email != "" {
-			subject, html := mailer.RenderPaid(u.Nickname, o.OutTradeNo, o.PriceCNY, o.Credits, o.Bonus, nowUTC())
+		if u, err := s.users.GetByID(ctx, locked.UserID); err == nil && u.Email != "" {
+			subject, html := mailer.RenderPaid(u.Nickname, locked.OutTradeNo, locked.PriceCNY, locked.Credits, locked.Bonus, paidAt)
 			s.mail.Send(mailer.Message{To: u.Email, Subject: subject, HTML: html})
 		}
 	}
@@ -322,27 +331,34 @@ func (s *Service) AdminListOrders(ctx context.Context, f ListFilter, offset, lim
 
 // AdminForcePaid 管理员手工将 pending 订单置为已支付并入账(发卡出错时的应急通道)。
 func (s *Service) AdminForcePaid(ctx context.Context, orderID uint64, actorID uint64) error {
-	o, err := s.dao.GetByID(ctx, orderID)
+	tx, err := s.dao.DB().BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	o, err := loadOrderForUpdate(ctx, tx, orderID)
 	if err != nil {
 		return err
 	}
 	if o.Status != StatusPending {
 		return ErrOrderStateInvalid
 	}
-	res, err := s.dao.DB().ExecContext(ctx,
+	paidAt := nowUTC()
+	_, err = tx.ExecContext(ctx,
 		`UPDATE recharge_orders
-           SET status = ?, paid_at = NOW(), trade_no = IFNULL(NULLIF(trade_no,''), ?)
-         WHERE id = ? AND status = ?`,
-		StatusPaid, fmt.Sprintf("manual-%d", actorID), orderID, StatusPending)
+           SET status = ?, paid_at = ?, trade_no = IFNULL(NULLIF(trade_no,''), ?)
+         WHERE id = ?`,
+		StatusPaid, paidAt, fmt.Sprintf("manual-%d", actorID), orderID)
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return ErrOrderStateInvalid
-	}
 	refID := fmt.Sprintf("order:%s", o.OutTradeNo)
 	remark := fmt.Sprintf("管理员手工入账:%s by admin=%d", o.Remark, actorID)
-	return s.billing.Recharge(ctx, o.UserID, o.TotalCredits(), refID, remark)
+	if err := s.billing.RechargeTx(ctx, tx, o.UserID, o.TotalCredits(), refID, remark); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ---------- helpers ----------
@@ -365,6 +381,103 @@ func rawDump(m map[string]string) *string {
 	}
 	s := v.Encode()
 	return &s
+}
+
+func (s *Service) insertOrder(ctx context.Context, o *Order) error {
+	cap := int64(0)
+	expireMinutes := 30
+	if s.settings != nil {
+		cap = s.settings.RechargeDailyLimitCNY()
+		expireMinutes = s.OrderExpireMinutes()
+	}
+	if cap <= 0 {
+		_, err := s.dao.CreateOrder(ctx, o)
+		return err
+	}
+
+	tx, err := s.dao.DB().BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := lockActiveUserForUpdate(ctx, tx, o.UserID); err != nil {
+		return err
+	}
+	reserved, err := sumReservedRechargeCNYTx(ctx, tx, o.UserID, expireMinutes)
+	if err != nil {
+		return err
+	}
+	if reserved+int64(o.PriceCNY) > cap {
+		return ErrDailyLimitExceeded
+	}
+	if err := createOrderTx(ctx, tx, o); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func notifyPayableStatus(status string) bool {
+	switch status {
+	case StatusPending, StatusCancelled, StatusExpired:
+		return true
+	default:
+		return false
+	}
+}
+
+func loadOrderForUpdate(ctx context.Context, tx *sqlx.Tx, id uint64) (*Order, error) {
+	var o Order
+	err := tx.GetContext(ctx, &o,
+		`SELECT * FROM recharge_orders WHERE id = ? FOR UPDATE`, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	return &o, err
+}
+
+func lockActiveUserForUpdate(ctx context.Context, tx *sqlx.Tx, userID uint64) error {
+	var id uint64
+	err := tx.QueryRowxContext(ctx,
+		`SELECT id FROM users WHERE id = ? AND deleted_at IS NULL FOR UPDATE`, userID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("user %d not found", userID)
+	}
+	return err
+}
+
+func sumReservedRechargeCNYTx(ctx context.Context, tx *sqlx.Tx, userID uint64, expireMinutes int) (int64, error) {
+	if expireMinutes <= 0 {
+		expireMinutes = 30
+	}
+	var sum sql.NullInt64
+	q := fmt.Sprintf(`SELECT COALESCE(SUM(price_cny), 0) FROM recharge_orders
+         WHERE user_id = ?
+           AND (
+             (status = 'paid' AND paid_at >= CURDATE())
+             OR
+             (status = 'pending' AND created_at >= (NOW() - INTERVAL %d MINUTE))
+           )`, expireMinutes)
+	if err := tx.GetContext(ctx, &sum, q, userID); err != nil {
+		return 0, err
+	}
+	return sum.Int64, nil
+}
+
+func createOrderTx(ctx context.Context, tx *sqlx.Tx, o *Order) error {
+	res, err := tx.ExecContext(ctx,
+		`INSERT INTO recharge_orders
+           (out_trade_no, user_id, package_id, price_cny, credits, bonus,
+            channel, pay_method, status, trade_no, pay_url, client_ip, remark)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		o.OutTradeNo, o.UserID, o.PackageID, o.PriceCNY, o.Credits, o.Bonus,
+		o.Channel, o.PayMethod, o.Status, o.TradeNo, o.PayURL, o.ClientIP, o.Remark)
+	if err != nil {
+		return err
+	}
+	id, _ := res.LastInsertId()
+	o.ID = uint64(id)
+	return nil
 }
 
 // verifyAmount 把 "12.00" 和 1200(分) 对比。

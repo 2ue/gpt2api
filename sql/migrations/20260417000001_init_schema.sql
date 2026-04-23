@@ -89,12 +89,14 @@ CREATE TABLE IF NOT EXISTS `credit_transactions` (
     `amount`         BIGINT          NOT NULL COMMENT '正值增加,负值减少',
     `balance_after`  BIGINT          NOT NULL,
     `ref_id`         VARCHAR(64)     NOT NULL DEFAULT '' COMMENT '关联业务单号(订单号/任务ID/请求ID)',
+    `biz_key`        VARCHAR(128)    NULL DEFAULT NULL COMMENT '可选业务幂等键,仅对需要强幂等的流水填充',
     `remark`         VARCHAR(255)    NOT NULL DEFAULT '',
     `created_at`     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (`id`),
     KEY `idx_user_created` (`user_id`, `created_at`),
     KEY `idx_key` (`key_id`),
-    KEY `idx_type` (`type`)
+    KEY `idx_type` (`type`),
+    UNIQUE KEY `uk_biz_key` (`biz_key`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='积分流水';
 
 -- ============================================================

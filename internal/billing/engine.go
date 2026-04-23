@@ -1,15 +1,17 @@
 // Package billing 实现「预扣+结算+退款」的积分计费闭环。
 //
 // 数据模型:
-//   users.credit_balance - 可用余额(厘)
-//   users.credit_frozen  - 冻结额度(厘)
-//   users.version        - 乐观锁版本号
-//   credit_transactions  - 流水(freeze/unfreeze/consume/refund ...)
+//
+//	users.credit_balance - 可用余额(厘)
+//	users.credit_frozen  - 冻结额度(厘)
+//	users.version        - 乐观锁版本号
+//	credit_transactions  - 流水(freeze/unfreeze/consume/refund ...)
 //
 // 流程:
-//   PreDeduct(userID, estCost, refID)   // balance -= est; frozen += est
-//   Settle(userID, est, actual, refID)  // frozen -= est; balance += (est-actual); 计 consume
-//   Refund(userID, est, refID)          // frozen -= est; balance += est
+//
+//	PreDeduct(userID, estCost, refID)   // balance -= est; frozen += est
+//	Settle(userID, est, actual, refID)  // frozen -= est; balance += (est-actual); 计 consume
+//	Refund(userID, est, refID)          // frozen -= est; balance += est
 package billing
 
 import (
@@ -17,6 +19,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jmoiron/sqlx"
 )
@@ -193,28 +196,45 @@ func (e *Engine) Refund(ctx context.Context, userID, keyID uint64, expected int6
 
 // Recharge 充值(订单回调使用)。
 func (e *Engine) Recharge(ctx context.Context, userID uint64, amount int64, refID, remark string) error {
+	return e.runTx(ctx, func(tx *sqlx.Tx) error {
+		return e.RechargeTx(ctx, tx, userID, amount, refID, remark)
+	})
+}
+
+// RechargeTx 在调用方已开启事务时执行充值入账。
+func (e *Engine) RechargeTx(ctx context.Context, tx *sqlx.Tx, userID uint64, amount int64, refID, remark string) error {
 	if amount <= 0 {
 		return errors.New("amount must be positive")
 	}
-	return e.runTx(ctx, func(tx *sqlx.Tx) error {
-		_, err := tx.ExecContext(ctx,
-			`UPDATE users SET credit_balance = credit_balance + ?, version = version + 1
-             WHERE id = ? AND deleted_at IS NULL`, amount, userID)
-		if err != nil {
-			return err
-		}
-		var balanceAfter int64
-		if err := tx.QueryRowxContext(ctx,
-			`SELECT credit_balance FROM users WHERE id = ?`, userID).Scan(&balanceAfter); err != nil {
-			return err
-		}
-		_, err = tx.ExecContext(ctx,
-			`INSERT INTO credit_transactions
-             (user_id, key_id, type, amount, balance_after, ref_id, remark)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-			userID, 0, KindRecharge, amount, balanceAfter, refID, remark)
+	res, err := tx.ExecContext(ctx,
+		`UPDATE users SET credit_balance = credit_balance + ?, version = version + 1
+         WHERE id = ? AND deleted_at IS NULL`, amount, userID)
+	if err != nil {
 		return err
-	})
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("user %d not found", userID)
+	}
+	var balanceAfter int64
+	if err := tx.QueryRowxContext(ctx,
+		`SELECT credit_balance FROM users WHERE id = ? AND deleted_at IS NULL`, userID).Scan(&balanceAfter); err != nil {
+		return err
+	}
+	bizKey := rechargeBizKey(refID)
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO credit_transactions
+         (user_id, key_id, type, amount, balance_after, ref_id, biz_key, remark)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		userID, 0, KindRecharge, amount, balanceAfter, refID, bizKey, remark)
+	return err
+}
+
+func rechargeBizKey(refID string) interface{} {
+	refID = strings.TrimSpace(refID)
+	if refID == "" {
+		return nil
+	}
+	return "recharge:" + refID
 }
 
 func (e *Engine) runTx(ctx context.Context, fn func(*sqlx.Tx) error) error {
