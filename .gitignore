@@ -68,6 +68,9 @@ venv/
 /deploy/logs/
 /deploy/updates/
 /deploy/web/
+/deploy/runtime/.env
+/deploy/runtime/data/
+/deploy/runtime/logs/
 
 # =============================================================================
 # 杂项

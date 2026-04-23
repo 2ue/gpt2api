@@ -1,0 +1,108 @@
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-gpt2api}
+      MYSQL_USER: ${MYSQL_USER:-gpt2api}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      TZ: ${TZ:-Asia/Shanghai}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-time-zone=+08:00
+      - --innodb-buffer-pool-size=512M
+      - --max-connections=500
+      - --default-authentication-plugin=mysql_native_password
+    volumes:
+      - ./data/mysql:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    command:
+      - sh
+      - -lc
+      - |
+        if [ -n "$$REDIS_PASSWORD" ]; then
+          exec redis-server --appendonly yes --requirepass "$$REDIS_PASSWORD"
+        fi
+        exec redis-server --appendonly yes
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          if [ -n "$$REDIS_PASSWORD" ]; then
+            redis-cli -a "$$REDIS_PASSWORD" ping | grep -q PONG
+          else
+            redis-cli ping | grep -q PONG
+          fi
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  server:
+    image: ${SERVER_IMAGE:-docker.io/2ue/gpt2api:0.0.2}
+    pull_policy: always
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: ${MYSQL_USER:-gpt2api}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-gpt2api}
+      GPT2API_APP_ENV: ${APP_ENV:-prod}
+      GPT2API_APP_BASE_URL: ${APP_BASE_URL}
+      GPT2API_LOG_LEVEL: ${LOG_LEVEL:-info}
+      GPT2API_LOG_FORMAT: ${LOG_FORMAT:-json}
+      GPT2API_MYSQL_DSN: "${MYSQL_USER:-gpt2api}:${MYSQL_PASSWORD}@tcp(mysql:3306)/${MYSQL_DATABASE:-gpt2api}?parseTime=true&loc=Local&charset=utf8mb4&collation=utf8mb4_unicode_ci"
+      GPT2API_MYSQL_MAX_OPEN_CONNS: ${MYSQL_MAX_OPEN_CONNS:-100}
+      GPT2API_REDIS_ADDR: "redis:6379"
+      GPT2API_REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      GPT2API_REDIS_POOL_SIZE: ${REDIS_POOL_SIZE:-100}
+      GPT2API_BACKUP_DIR: /app/data/backups
+      GPT2API_BACKUP_RETENTION: ${BACKUP_RETENTION:-30}
+      GPT2API_BACKUP_ALLOW_RESTORE: ${BACKUP_ALLOW_RESTORE:-false}
+      GPT2API_JWT_SECRET: ${JWT_SECRET}
+      GPT2API_CRYPTO_AES_KEY: ${CRYPTO_AES_KEY}
+      GPT2API_UPSTREAM_REQUEST_TIMEOUT_SEC: ${UPSTREAM_REQUEST_TIMEOUT_SEC:-60}
+      GPT2API_UPSTREAM_SSE_READ_TIMEOUT_SEC: ${UPSTREAM_SSE_READ_TIMEOUT_SEC:-300}
+      GPT2API_EPAY_GATEWAY_URL: ${EPAY_GATEWAY_URL:-}
+      GPT2API_EPAY_PID: ${EPAY_PID:-}
+      GPT2API_EPAY_KEY: ${EPAY_KEY:-}
+      GPT2API_EPAY_NOTIFY_URL: ${EPAY_NOTIFY_URL:-}
+      GPT2API_EPAY_RETURN_URL: ${EPAY_RETURN_URL:-}
+      GPT2API_EPAY_SIGN_TYPE: ${EPAY_SIGN_TYPE:-MD5}
+      GPT2API_EPAY_EXPIRES_MIN: ${EPAY_EXPIRES_MIN:-30}
+      GPT2API_SMTP_HOST: ${SMTP_HOST:-}
+      GPT2API_SMTP_PORT: ${SMTP_PORT:-465}
+      GPT2API_SMTP_USERNAME: ${SMTP_USERNAME:-}
+      GPT2API_SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      GPT2API_SMTP_FROM: ${SMTP_FROM:-}
+      GPT2API_SMTP_FROM_NAME: ${SMTP_FROM_NAME:-GPT2API}
+      GPT2API_SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+    ports:
+      - "${HTTP_PORT:-8080}:8080"
+    dns:
+      - ${DNS_PRIMARY:-8.8.8.8}
+      - ${DNS_FALLBACK:-1.1.1.1}
+    volumes:
+      - ./data/backups:/app/data/backups
+      - ./logs:/app/logs
+    command: ["/app/gpt2api", "-c", "/app/configs/config.example.yaml"]
