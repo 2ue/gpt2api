@@ -143,7 +143,7 @@ var Defs = []KeyDef{
 	{Key: ProxyProbeEnabled, Type: "bool", Category: "gateway", Default: "true", Label: "代理探测开关", Desc: "开启后后台定时对启用的代理做连通性探测,更新健康分"},
 	{Key: ProxyProbeIntervalSec, Type: "int", Category: "gateway", Default: "300", Label: "代理探测间隔(秒)", Desc: "两轮探测之间的间隔,建议 ≥ 60"},
 	{Key: ProxyProbeTimeoutSec, Type: "int", Category: "gateway", Default: "10", Label: "代理探测超时(秒)", Desc: "单条代理一次探测的超时时间"},
-	{Key: ProxyProbeTargetURL, Type: "url", Category: "gateway", Default: "https://www.gstatic.com/generate_204", Label: "代理探测目标 URL", Desc: "返回 2xx/3xx 视为成功,留空使用默认"},
+	{Key: ProxyProbeTargetURL, Type: "url", Category: "gateway", Default: "", Label: "代理探测目标 URL", Desc: "返回 2xx/3xx 视为成功。**留空(推荐)**时走内置候选链(api.ipify.org / cloudflare cdn-cgi/trace / httpbin.org),任意一个通过即判代理可用;填单一 URL 则只用该地址(代理若恰好被该站限制会被误判为失败)"},
 	{Key: ProxyProbeConcurrency, Type: "int", Category: "gateway", Default: "8", Label: "代理探测并发", Desc: "同时探测的代理数(1~64)"},
 
 	// ---------- 账号池(AT 刷新 / 额度探测) ----------
@@ -152,7 +152,7 @@ var Defs = []KeyDef{
 	{Key: AccountRefreshAheadSec, Type: "int", Category: "gateway", Default: "900", Label: "账号预刷新提前量(秒)", Desc: "距离过期多少秒内就触发刷新,建议 ≥ 300"},
 	{Key: AccountRefreshConcurrency, Type: "int", Category: "gateway", Default: "4", Label: "账号刷新并发", Desc: "同时刷新的账号数(1~32)"},
 	{Key: AccountQuotaProbeEnabled, Type: "bool", Category: "gateway", Default: "true", Label: "账号额度自动探测", Desc: "后台定期查询账号的图片剩余额度"},
-	{Key: AccountQuotaProbeIntervalSec, Type: "int", Category: "gateway", Default: "900", Label: "额度探测最小间隔(秒)", Desc: "同一账号两次探测之间的最小间隔,避免过度请求"},
+	{Key: AccountQuotaProbeIntervalSec, Type: "int", Category: "gateway", Default: "18000", Label: "额度探测最小间隔(秒)", Desc: "同一账号两次探测的最小间隔,默认 **18000=5 小时**;当账号剩余额度=0 且已过重置时间时,会忽略此间隔立即补探一次,以第一时间反映真实恢复额度"},
 	{Key: AccountDefaultClientID, Type: "string", Category: "gateway", Default: "app_EMoamEEZ73f0CkXaXp7hrann", Label: "导入账号默认 client_id", Desc: "JSON 未指定时使用的 OAuth client_id"},
 
 	// ---------- 图片路由 ----------

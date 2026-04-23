@@ -73,6 +73,8 @@ type ImageGenRequest struct {
 	RoutePolicy       string   `json:"route_policy,omitempty"`    // auto | safe | responses
 	User              string   `json:"user,omitempty"`
 	ReferenceImages   []string `json:"reference_images,omitempty"` // 非标准扩展,见注释
+	// Upscale 非标准扩展:控制图片代理输出时的本地高清放大档位。
+	Upscale string `json:"upscale,omitempty"` // "" | "2k" | "4k"
 }
 
 // ImageGenData 单张图响应。
@@ -123,6 +125,7 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 	if req.Size == "" {
 		req.Size = "1024x1024"
 	}
+	req.Upscale = image.ValidateUpscale(req.Upscale)
 
 	refs, err := decodeReferenceInputs(c.Request.Context(), req.ReferenceImages)
 	if err != nil {
@@ -203,6 +206,7 @@ func (h *ImagesHandler) ImageGenerations(c *gin.Context) {
 			Prompt:             canonical.Prompt,
 			N:                  canonical.N,
 			Size:               canonical.Size,
+			Upscale:            req.Upscale,
 			Operation:          canonical.Operation,
 			RoutePolicy:        canonical.RoutePolicy,
 			RequestOptionsJSON: canonical.RequestOptionsJSON(),
@@ -307,6 +311,7 @@ func (h *ImagesHandler) ImageTask(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"task_id":         t.TaskID,
 		"status":          t.Status,
+		"upscale":         t.Upscale,
 		"conversation_id": t.ConversationID,
 		"created":         t.CreatedAt.Unix(),
 		"finished_at":     nullableUnix(t.FinishedAt),
@@ -580,6 +585,7 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 	if size == "" {
 		size = "1024x1024"
 	}
+	upscale := image.ValidateUpscale(c.Request.FormValue("upscale"))
 
 	baseFiles, maskFile, err := collectEditInputs(c.Request.MultipartForm)
 	if err != nil {
@@ -685,6 +691,7 @@ func (h *ImagesHandler) ImageEdits(c *gin.Context) {
 			Prompt:             canonical.Prompt,
 			N:                  canonical.N,
 			Size:               canonical.Size,
+			Upscale:            upscale,
 			Operation:          canonical.Operation,
 			RoutePolicy:        canonical.RoutePolicy,
 			RequestOptionsJSON: canonical.RequestOptionsJSON(),

@@ -31,6 +31,7 @@ type taskView struct {
 	Prompt         string     `json:"prompt"`
 	N              int        `json:"n"`
 	Size           string     `json:"size"`
+	Upscale        string     `json:"upscale,omitempty"`
 	Status         string     `json:"status"`
 	ConversationID string     `json:"conversation_id,omitempty"`
 	Error          string     `json:"error,omitempty"`
@@ -58,7 +59,7 @@ func (h *MeHandler) toView(ctx context.Context, t *Task) taskView {
 	}
 	return taskView{
 		ID: t.ID, TaskID: t.TaskID, UserID: t.UserID, ModelID: t.ModelID,
-		AccountID: t.AccountID, Prompt: t.Prompt, N: t.N, Size: t.Size,
+		AccountID: t.AccountID, Prompt: t.Prompt, N: t.N, Size: t.Size, Upscale: t.Upscale,
 		Status: t.Status, ConversationID: t.ConversationID, Error: t.Error,
 		CreditCost: t.CreditCost, ImageURLs: urls, FileIDs: fids,
 		CreatedAt: t.CreatedAt, StartedAt: t.StartedAt, FinishedAt: t.FinishedAt,

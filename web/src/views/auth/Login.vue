@@ -13,7 +13,7 @@ const site = useSiteStore()
 
 const siteName = computed(() => site.get('site.name', 'GPT2API'))
 const siteDesc = computed(() =>
-  site.get('site.description', '基于 chatgpt.com 的 OpenAI 兼容网关 · 多账号池 · IMG2 灰度 · 批量出图'),
+  site.get('site.description', '基于 chatgpt.com 的 OpenAI 兼容网关 · 多账号池 · IMG2 终稿直出 · 批量出图'),
 )
 const siteLogo = computed(() => site.get('site.logo_url', ''))
 const siteFooter = computed(() => site.get('site.footer', ''))
@@ -66,7 +66,7 @@ async function onSubmit() {
       </div>
       <p class="tagline">{{ siteDesc }}</p>
       <ul class="features">
-        <li><el-icon><Lightning /></el-icon> 多账号池 / 多代理池 · IMG2 灰度命中 · 批量出图 · 高并发调度</li>
+        <li><el-icon><Lightning /></el-icon> 多账号池 / 多代理池 · IMG2 终稿直出 · 批量出图 · 高并发调度</li>
         <li><el-icon><Lock /></el-icon> RBAC 权限 · 全链路审计 · 数据库一键备份 / 恢复</li>
         <li><el-icon><Medal /></el-icon> 积分钱包 · 预扣结算 · 易支付接入 · 用量透明</li>
       </ul>

@@ -1,6 +1,6 @@
 # gpt2api
 
-> 基于逆向 **chatgpt.com** 的 OpenAI 兼容 SaaS 网关 —— 多账号池 / 代理池 / **IMG2 灰度命中** / **批量出图** / **高并发调度** / 积分计费 / 管理后台一体化。
+> 基于逆向 **chatgpt.com** 的 OpenAI 兼容 SaaS 网关 —— 多账号池 / 代理池 / **IMG2 终稿直出** / **批量出图** / **本地 2K/4K 高清放大** / **高并发调度** / 积分计费 / 管理后台一体化。
 
 <p align="center">
   <a href="https://github.com/432539/gpt2api/stargazers"><img alt="stars" src="https://img.shields.io/github/stars/432539/gpt2api?style=flat-square"></a>
@@ -26,9 +26,10 @@
 - [六、配置说明](#六配置说明)
 - [七、API 使用示例](#七api-使用示例)
 - [八、重点能力详解](#八重点能力详解)
-  - [8.1 IMG2 灰度命中测试](#81-img2-灰度命中测试)
-  - [8.2 批量出图 / 多张聚合](#82-批量出图--多张聚合)
-  - [8.3 高性能高并发调度](#83-高性能高并发调度)
+  - [8.1 IMG2 出图](#81-img2-出图)
+  - [8.2 4K / 2K 高清输出(本地 Catmull-Rom 放大)](#82-4k--2k-高清输出本地-catmull-rom-放大)
+  - [8.3 批量出图 / 多张聚合](#83-批量出图--多张聚合)
+  - [8.4 高性能高并发调度](#84-高性能高并发调度)
 - [九、管理后台功能概览](#九管理后台功能概览)
 - [十、目录结构](#十目录结构)
 - [十一、二次开发 / 定制](#十一二次开发--定制)
@@ -50,13 +51,13 @@
 - 想给公司 / 团队内部开通 OpenAI 风格的代理网关,把所有调用统计、计费、审计集中管理;
 - 想低成本搭一个带积分 / 套餐 / 易支付的 AI API 中台,面向 C 端或 B 端开发者售卖。
 
-> 本项目当前版本**聚焦图片模型**(详见 [8.1 IMG2 灰度命中测试](#81-img2-灰度命中测试) 与 [8.2 批量出图](#82-批量出图--多张聚合))。文字通路(`/v1/chat/completions`)代码层完整保留,但因 `chatgpt.com` 新 sentinel 协议存在短期不稳定因素,UI 入口已在当前版本关闭,恢复只需改一行 feature flag,详见 [十一、二次开发](#十一二次开发--定制)。
+> 本项目当前版本**聚焦图片模型**(详见 [8.1 IMG2 出图](#81-img2-出图)、[8.2 4K/2K 高清输出](#82-4k--2k-高清输出本地-catmull-rom-放大) 与 [8.3 批量出图](#83-批量出图--多张聚合))。文字通路(`/v1/chat/completions`)代码层完整保留,但因 `chatgpt.com` 新 sentinel 协议存在短期不稳定因素,UI 入口已在当前版本关闭,恢复只需改一行 feature flag,详见 [十一、二次开发](#十一二次开发--定制)。
 
 ---
 
 ## 📸 界面预览
 
-> 截图来自 **在线体验(Playground)** 页 · `gpt-image-2` / `picture_v2`(IMG2 灰度)· `9:16` 比例 · 单次调用一张 prompt 批量出图。
+> 截图来自 **在线体验(Playground)** 页 · `gpt-image-2` / `picture_v2`(IMG2 终稿)· `9:16` 比例 · 单次调用一张 prompt 批量出图。
 
 ### 在线体验 · 文生图 / 批量出图
 
@@ -84,7 +85,7 @@
 | 分类 | 能力 |
 |------|------|
 | **上游协议** | 完整逆向 `chatgpt.com` `f/conversation` 两步 sentinel(`/prepare` + `/finalize`)、PoW、`conduit_token`、全套 `oai-*` / `Sec-Ch-Ua-*` 指纹头 |
-| **图片生成** | 文生图、**图生图 / 多图参考**、**IMG2 灰度命中**(单次调用返回多张高清终稿)、**preview_only 自动重试**、轮询 + SSE 直出双通道 |
+| **图片生成** | 文生图、**图生图 / 多图参考**、**IMG2 正式版直出**(速度优先,SSE 够数即返回,60s 短轮询补齐)、**本地 2K/4K PNG 高清放大**(Catmull-Rom 插值,按需触发 + 进程内 LRU)、轮询 + SSE 直出双通道 |
 | **账号池** | JSON / AT / RT / ST 四种方式批量导入,**自动刷新**、**额度探测**、**风控熔断**、按账号稳定绑定 `oai-device-id` / `oai-session-id` |
 | **代理池** | 支持 HTTP / SOCKS5,健康分自动探测,按账号强绑定代理,避免 IP 指纹混用 |
 | **调度器** | 串行 lease + Redis 分布式锁,`min_interval_sec` 单号最小间隔、`daily_usage_ratio` 日熔断、`cooldown_429_sec` 限速退避 |
@@ -181,7 +182,7 @@ flowchart LR
 3. Scheduler 从账号池挑一个 `idle` 且满足 `min_interval_sec` 的账号,拿 Redis 锁建立 lease;
 4. 通过账号绑定的代理,走 `utls` TLS 指纹,按真实 Edge 143 浏览器的 header/payload 访问 `chatgpt.com`;
 5. 两步 sentinel 换 chat-requirements token → `/f/conversation/prepare` 拿 `conduit_token` → SSE 上游生图;
-6. 解析 tool message 拿 `fids` / `sids`,若是 `preview_only` 则在同一对话里重试最多 3 次争取 IMG2 灰度;
+6. 解析 tool message 拿 `fids` / `sids`,够 N 张立即短路下载,不够再短轮询 60s 补齐;
 7. 所有图片 URL 经 HMAC 签名,返回 `https://<your-domain>/p/img/<task>/<idx>?exp=…&sig=…`;
 8. 扣费结算 + 写 usage_logs + 释放 lease + 更新账号状态。
 
@@ -189,18 +190,79 @@ flowchart LR
 
 ## 五、快速开始(Docker 一键部署)
 
+> ⚠️ **本项目的 Dockerfile 是"宿主预编译 + 容器运行"架构**(为规避国内拉 `proxy.golang.org` / npm registry 卡死的问题)。容器内**不做** `go build` / `npm install`,完全依赖宿主机先产出二进制和前端产物。  
+> 因此步骤是:**准备环境 → 克隆仓库 → 本地预编译 → docker compose build + up**。直接 `docker compose up --build` 会报 `deploy/bin/gpt2api: not found`。
+
 ### 1. 准备环境
 
-- Docker 24+
-- docker compose 插件
-- 一个能直连 `chatgpt.com` 的 VPS,或者至少一个可用的 HTTP / SOCKS5 代理
-- 至少 1 个 ChatGPT Plus / Team / Codex 账号(能导出 AT / RT / ST 或 JSON 会话信息)
+**宿主机(打包机)需要安装**:
 
-### 2. 克隆 + 启动
+| 软件 | 最低版本 | 用途 |
+|------|---------|------|
+| **Go** | 1.22+ | 交叉编译 `gpt2api` + `goose` 二进制 |
+| **Node.js** | 18+(推荐 20 LTS)| 编译前端 Vite 产物 |
+| **Docker** | 24+ | 构建 + 运行镜像 |
+| **docker compose** | v2 插件 | 启动 mysql / redis / server 编排 |
+| **git** | 任意 | 克隆仓库 |
+
+> Windows 用户装 Go + Node + Docker Desktop 即可;Linux 服务器一条 `apt install -y golang-go nodejs npm docker.io docker-compose-plugin` 基本够用。  
+> 打包机与运行机**不必是同一台**,`build-local.sh/ps1` 默认交叉编译成 `linux/amd64`,产出拷到服务器上也能直接 `docker compose build` 起。
+
+**运行环境需要**:
+
+- 一个能直连 `chatgpt.com` 的 VPS,或者至少一个可用的 HTTP / SOCKS5 代理;
+- 至少 1 个 ChatGPT Plus / Team / Codex 账号(能导出 AT / RT / ST 或 JSON 会话信息)。
+
+### 2. 克隆仓库
 
 ```bash
 git clone https://github.com/432539/gpt2api.git
-cd gpt2api/deploy
+cd gpt2api
+```
+
+### 3. 本地预编译(**必做,容器内不会帮你 build**)
+
+这一步会产出三个东西,镜像 COPY 进去就能直接起:
+
+| 产物 | 路径 | 由谁产出 |
+|------|------|---------|
+| 后端二进制(linux/amd64) | `deploy/bin/gpt2api` | `go build ./cmd/server` |
+| 迁移工具(linux/amd64) | `deploy/bin/goose` | `go build github.com/pressly/goose/v3/cmd/goose@v3.20.0` |
+| 前端产物 | `web/dist/` | `cd web && npm install && npm run build` |
+
+仓库已经把**这三步打包到一个脚本**,一条命令搞定:
+
+**Linux / macOS / WSL:**
+
+```bash
+bash deploy/build-local.sh
+# 增量:只编译缺失的 goose。第一次会自动 npm install(首次慢,之后秒级)
+# 强制重编译 goose:bash deploy/build-local.sh --force
+```
+
+**Windows PowerShell:**
+
+```powershell
+powershell -NoProfile -File deploy\build-local.ps1
+# 强制重编译 goose:powershell -NoProfile -File deploy\build-local.ps1 -Force
+```
+
+脚本结束后应当能看到:
+
+```text
+[build-local] done. artifacts:
+-rwxr-xr-x ... deploy/bin/gpt2api       ~32M
+-rwxr-xr-x ... deploy/bin/goose         ~34M
+-rw-r--r-- ... web/dist/index.html
+```
+
+> 改完后端代码后**只需重跑 `build-local` 再 `docker compose build server`**;改前端只跑 `npm run build` + `docker compose build server` 即可。  
+> 有同事反馈 `go get` / `npm install` 慢,可以先 `go env -w GOPROXY=https://goproxy.cn,direct` 和 `npm config set registry https://registry.npmmirror.com`。
+
+### 4. 配置 `.env` 与启动容器
+
+```bash
+cd deploy
 cp .env.example .env
 ```
 
@@ -223,7 +285,8 @@ openssl rand -base64 48 | tr -d '=/+' | cut -c1-48   # JWT_SECRET
 启动:
 
 ```bash
-docker compose up -d --build
+docker compose build server    # 首次或后端/前端代码有更新后执行
+docker compose up -d
 docker compose logs -f server
 ```
 
@@ -233,19 +296,31 @@ docker compose logs -f server
 2. 跑 `goose up` 应用全部迁移(用户 / 账号 / 审计 / 备份元数据等十余张表);
 3. 启动 HTTP 服务 `:8080`。
 
-### 3. 首次登录
+### 5. 首次登录
 
-- 管理后台地址:`http://<服务器IP>:8080/`
-- 默认超管:`admin@example.com` / `admin123`(**请务必第一时间登入后台修改密码**)
+- 前端站点地址:`http://<服务器IP>:8080/`
+- **本项目不内置任何默认账号密码**。采用"**首位注册者自动为 admin**"的 Bootstrap 机制(见 `internal/auth/service.go` 中的 `Register`)—— 第一次访问站点时直接打开 `http://<服务器IP>:8080/register` 完成注册,这个账号自动获得 `admin` 角色,后续注册都只是普通用户。
+- 完成首位 admin 注册后,强烈建议在**管理后台 → 系统设置**里关闭"允许开放注册",避免陌生人自助注册占用资源。
+- 忘记管理员密码、或需要把某个普通用户提权为 admin,见「FAQ · 管理员密码找回 / 提权」。
 
-### 4. 五分钟跑通第一次生图
+### 6. 日常更新流程速查
+
+| 场景 | 命令 |
+|------|------|
+| **仅改了前端** | `cd web && npm run build` → `cd ../deploy && docker compose build server && docker compose up -d server` |
+| **仅改了后端** | `bash deploy/build-local.sh`(前端 `npm run build` 无代价也会重跑)→ `cd deploy && docker compose build server && docker compose up -d server` |
+| **拉 main 新版** | `git pull` → `bash deploy/build-local.sh` → `docker compose build server && docker compose up -d server` |
+| **只重启不重建** | `docker compose restart server` |
+| **想回滚上一版** | `docker compose down server` → 恢复 `deploy/bin/gpt2api` + `web/dist` 备份 → `docker compose build server && docker compose up -d server` |
+
+### 7. 五分钟跑通第一次生图
 
 1. **管理后台 → 代理管理** → 新建一个代理(或批量导入),确认健康分为绿色;
 2. **管理后台 → GPT账号** → 批量导入 JSON / AT / RT / ST,绑定上一步的代理;
 3. **管理后台 → 模型配置** → 确认有 `gpt-image-2` 等图像模型且已启用;
 4. **管理后台 → 用户管理** → 给自己(或业务账号)加点积分;
 5. **个人中心 → 在线体验** → 文生图 tab → 输入 prompt → 点生成;
-6. 观察 `docker compose logs -f server` 里 `image runner` 系列日志,看到 `image runner result summary turns_used=1 is_preview=false signed_count=N` 就是成功命中 IMG2 / IMG1。
+6. 观察 `docker compose logs -f server` 里 `image runner` 系列日志,看到 `image runner result summary refs=[...] signed_count=N` 就是成功出图。
 
 ---
 
@@ -301,6 +376,8 @@ curl https://your-domain.com/v1/images/generations \
   ]
 }
 ```
+
+**可选:本地 2K / 4K 高清放大** —— 在 body 里加 `"upscale": "2k"` 或 `"upscale": "4k"`,后端会在图片代理 URL 首次被请求时对原图做 Catmull-Rom 插值放大并以 PNG 返回(长边 2560 / 3840 等比缩)。算法本地执行,不调用任何外部服务;首次 ~0.5~1.5s,之后进程内 LRU 毫秒级命中。**请注意这是传统插值算法,不是 AI 超分**,不会补出新纹理。详见 [8.2 4K / 2K 高清输出](#82-4k--2k-高清输出本地-catmull-rom-放大)。
 
 ### 7.2 图生图 / 多图参考(项目扩展字段)
 
@@ -359,56 +436,106 @@ curl https://your-domain.com/v1/images/tasks/img_xxx \
 
 ## 八、重点能力详解
 
-### 8.1 IMG2 灰度命中测试
+### 8.1 IMG2 出图
 
-`chatgpt.com` 自 2026 年起对 Plus / Team 账号灰度推出 **IMG2 管线**:**单次调用直接返回 2 张高清终稿**,跳过 IMG1 的预览中间态;命中 IMG2 的账号体感是**出图速度更快、画质更好、一次给两张**。
+`chatgpt.com` 的 **IMG2 管线已正式上线**:Plus / Team 账号单次调用可返回 1~2 张高清图,体感就是**出图更快、画质更好**。`gpt2api` 的生图链路已全面对齐正式版协议,不再做"灰度命中判定 / preview_only 重试"这类节流:
 
-#### 如何判断自己命中了 IMG2?
+- **速度优先**:SSE 里出现 `file-service` / `sediment` 引用立即下载,**不等齐 N 张**;
+- **单轮单账号**:一次 `f/conversation` 最多短轮询 60 秒补齐,超时仍有 ≥ 1 张也按成功返回;
+- **硬错误才切账号**:只有 `rate_limited` / `no_available_account` / `auth_required` 才会触发一次跨账号重试,其他错误直接暴露给调用方便于排障。
+
+#### 如何判断本次成功出图?
 
 `gpt2api` 在图片生成的每一个关键节点都打了结构化日志,观察 `docker compose logs -f server` 中的 `image runner` 系列:
 
 ```text
-image runner SSE parsed         sse_fids=[file_xxx,file_yyy] finish_type=stop image_gen_task_id=...
-image runner IMG2 direct hit (from SSE)    # ★ 看到这条 = SSE 流里直接返回了 2 张
-image runner poll done          poll_status=IMG2 poll_fids=[file_xxx,file_yyy]
-image runner IMG2 poll hit      # ★ 或者这条 = 轮询阶段拿到 IMG2
-image runner result summary     turns_used=1 is_preview=false refs=[{fid,sid},{fid,sid}] signed_count=2
+image runner SSE parsed                  sse_fids=[file_xxx,file_yyy] finish_type=stop image_gen_task_id=...
+image runner enough refs from SSE, skip polling   # SSE 阶段已够数,0 次轮询
+image runner poll done                   poll_status=success poll_fids=[file_xxx]
+image runner result summary              refs=[...] signed_count=2
 ```
 
-反过来,没命中 IMG2 时典型日志(会自动最多重试 3 轮在同一会话里争取终稿):
+如果 Poll 超时(60s 内没拿到任何图),会直接落到 `poll_timeout`,不再悄悄换账号重试。
 
-```text
-image runner preview_only, retry in same conversation   turn=1 max_turns=3
-image runner result summary     turns_used=3 is_preview=true signed_count=1
-```
+#### 数据库里复盘
 
-#### 测试方法
-
-1. 导入若干 Plus 账号,在「GPT账号」页面「全部探测」一下基础额度;
-2. 在「在线体验」用一段**固定、确定能过合规**的 prompt(例如 `a cute orange cat playing with yarn`)连续跑 5 次;
-3. 后端统计两类日志:
-   - **IMG2 命中率** = `image runner IMG2 *hit*` 的次数 / 总次数;
-   - **IMG1 预览率(fallback)** = `result summary is_preview=true` 的次数 / 总次数;
-4. 在「管理后台 → GPT账号」里对比不同账号的命中率,把低命中号放到 VIP / 非关键业务池,把高命中号分给关键业务;
-5. 批量测试脚本可以直接用 SDK 并发跑(示例见 [8.2 批量出图](#82-批量出图--多张聚合))。
-
-#### 数据库里也能复盘
-
-每张图片都会被持久化到 `image_tasks` 表,带上 `account_id` / `status` / `image_urls`。一条 SQL 就能拉出每个账号的近期 IMG2 命中率:
+每张图片都会被持久化到 `image_tasks` 表,带上 `account_id` / `status` / `image_urls`:
 
 ```sql
 SELECT
   account_id,
-  COUNT(*)                                                           AS total,
-  SUM(JSON_LENGTH(image_urls) >= 2)                                  AS img2_count,
-  ROUND(SUM(JSON_LENGTH(image_urls) >= 2) * 100 / COUNT(*), 2)       AS img2_rate_pct
+  COUNT(*)                                AS total,
+  SUM(status = 'success')                 AS success,
+  ROUND(SUM(status = 'success') * 100 / COUNT(*), 2) AS success_rate_pct,
+  ROUND(AVG(JSON_LENGTH(image_urls)), 2)  AS avg_imgs_per_task
 FROM image_tasks
-WHERE status = 'success' AND created_at > NOW() - INTERVAL 1 DAY
+WHERE created_at > NOW() - INTERVAL 1 DAY
 GROUP BY account_id
-ORDER BY img2_rate_pct DESC;
+ORDER BY success_rate_pct DESC;
 ```
 
-### 8.2 批量出图 / 多张聚合
+### 8.2 4K / 2K 高清输出(本地 Catmull-Rom 放大)
+
+`chatgpt.com` 原生只提供 `1024×1024` / `1792×1024` / `1024×1792` 三档原图。面板 / API 都支持一个扩展字段 `upscale`,在**拿到原图后**由网关在本地把画面放大到 2K / 4K 后以 PNG 返回。
+
+#### 档位与尺寸
+
+| `upscale` | 长边 | 举例(原 1024×1024) | 举例(原 1792×1024) |
+|-----------|------|---------------------|---------------------|
+| `""`(默认) | 原图 | 1024×1024 | 1792×1024 |
+| `"2k"` | 2560 | 2560×2560 | 2560×1463 |
+| `"4k"` | 3840 | 3840×3840 | 3840×2194 |
+
+短边按原比例等比缩,不做裁切;**若原图长边已经 ≥ 目标,直接透传原字节**(避免重复有损编码)。
+
+#### 工作原理
+
+1. 生图时 `upscale` 只写进 `image_tasks.upscale`,**不改变**与上游 `chatgpt.com` 的交互,也不影响生图速度;
+2. 图片代理 URL `/p/img/:task_id/:idx` 被请求时,后端按 `task.upscale` 决定是否放大:
+   - 查进程内 **LRU 缓存**(默认 512MB,约 50 张 4K PNG);
+   - 未命中 → 拉原图 → `image.Decode` → `golang.org/x/image/draw.CatmullRom` → `png.Encode`(BestSpeed) → 写入 LRU;
+   - 命中 → 毫秒级直接返回字节。
+3. 放大计算有**并发信号量**限制(默认 `NumCPU`),避免 4K 请求风暴把 CPU 打满影响主生图链路;
+4. 放大失败自动**回落到原图**,不给用户白屏。
+
+响应头 `X-Upscale` 便于排障:
+
+```text
+X-Upscale: 4k;cache=miss   # 首次放大
+X-Upscale: 4k;cache=hit    # 命中缓存
+X-Upscale: 4k;noop         # 原图长边已足够大,未重新编码
+X-Upscale: 4k;err          # 放大失败,已回落到原图
+```
+
+#### API 调用
+
+```bash
+curl https://your-domain.com/v1/images/generations \
+  -H "Authorization: Bearer sk-xxx" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gpt-image-2",
+    "prompt": "a futuristic city at dusk, cinematic light",
+    "n": 1,
+    "size": "1792x1024",
+    "upscale": "4k"
+  }'
+```
+
+`/v1/images/edits`(multipart/form-data)同样支持 `upscale` 字段。
+
+#### 面板操作
+
+**个人中心 → 在线体验 → 文生图 / 图生图**,左侧表单新增「**输出尺寸**」单选:原图 / 2K 高清 / 4K 高清,默认原图。切换后重新生成的图代理 URL 会自动走对应放大档位。
+
+#### 取舍与注意事项
+
+- **不是 AI 超分**:Catmull-Rom 是传统双三次插值,只会把画面变"更大、更平滑",不会补出新的毛发、纹理、细节。对"原图本身细节不足"的画面,4K 的视觉收益有限;
+- **4K 文件较大**:单张 4K PNG 通常 5~15MB。首屏仅加载 1~2 张没问题,大批量下载请考虑改调 `"2k"` 或直接用原图;
+- **原图 1792 → 4K 仅 2.14x**;而方形 1024 → 4K 是 3.75x,**方形档位的视觉"放大感"最强**,效果差异也最明显;
+- 若需要真正的"补细节"效果,请接入 Real-ESRGAN / SwinIR 等 AI 超分模型,那是另一个工程量级(需要模型权重 + GPU / ONNX Runtime),不在当前项目范围。
+
+### 8.3 批量出图 / 多张聚合
 
 `gpt2api` 支持三种"批量"场景:
 
@@ -418,7 +545,7 @@ ORDER BY img2_rate_pct DESC;
 | **多请求并发** | SDK 线程池同时发 K 个请求 | K 个账号 lease 并行,受限于账号池数 × `min_interval_sec` |
 | **纯异步任务池** | `{"async": true}` 提交 + 轮询 | 后端 Worker 池消费,适合 1000+ 条 prompt 的大批量场景 |
 
-**单请求多张(`n`)**:IMG2 灰度账号下,`n=2` 通常一次就到位;`n>2` 会被框架拆成多轮 follow-up 请求在**同一会话**里完成,共享一个 account lease,避免占用多个账号。
+**单请求多张(`n`)**:IMG2 终稿通道下,`n=2` 通常一次就到位;`n>2` 会被框架拆成多轮 follow-up 请求在**同一会话**里完成,共享一个 account lease,避免占用多个账号。
 
 **多请求并发(脚本示例)**:
 
@@ -440,7 +567,7 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=32) as ex:
 
 **账号池够大时,脚本端只需控制 `max_workers`,后端会自动按 `min_interval_sec` 给每个账号排队**,不会因为并发撞风控。
 
-### 8.3 高性能高并发调度
+### 8.4 高性能高并发调度
 
 #### 并发目标
 
@@ -601,11 +728,13 @@ chatgpt.com 的实际上游 slug 会随账号等级微调(例如 Plus 用 `gpt-5
 </details>
 
 <details>
-<summary><b>Q2. IMG2 命中率偏低怎么办?</b></summary>
+<summary><b>Q2. 出图偶尔 poll_timeout 怎么办?</b></summary>
 
-1. 确保账号是 Plus / Team,Free 账号不会进 IMG2 灰度;
-2. 看 `image runner result summary` 的 `turns_used`,如果反复命中 `preview_only, retry`,说明账号本周没被灰度;
-3. 把低命中号降级用于非关键业务,高命中号绑定关键客户。
+IMG2 正式上线后,`gpt2api` 默认 SSE 解析完成后最多短轮询 60 秒补齐图片。如果依然没拿到任何 `file-service` / `sediment` 引用,会直接抛 `poll_timeout` 给调用方,**不会再悄悄换账号重试**(那样只会吞掉用户时间)。常见处理:
+
+1. 在「管理后台 → GPT账号」对该账号做「全部探测」,确认代理 / 账号本身可用;
+2. 把长期 `poll_timeout` 的账号绑定到更快的代理,或移出主力池;
+3. 如果想在网关层面做"失败切账号"的托底重试,自行在客户端实现即可——这符合"出错就让上层看到"的设计原则。
 </details>
 
 <details>
@@ -638,6 +767,63 @@ chatgpt.com 的实际上游 slug 会随账号等级微调(例如 Plus 用 `gpt-5
 当前聚焦 `chatgpt.com` 逆向(涵盖 GPT-5 / GPT-5-3 / gpt-image-2 / Codex 等)。Claude / Gemini 需要接入各自原生 API 或其对应的逆向客户端,不在当前仓库范围内。
 </details>
 
+<details>
+<summary><b>Q8. 管理员密码找回 / 把某个普通用户提权为 admin?</b></summary>
+
+本项目没有内置默认 admin 账号(见「5. 首次登录」的 Bootstrap 说明),忘记密码时有两种救急手段:
+
+**① 提权已有用户为 admin**(前提:你记得该账号的密码)
+
+```bash
+# 替换成你的 MySQL 容器名 / 用户名 / 密码 / 目标邮箱
+docker exec -e MYSQL_PWD='<your_mysql_password>' gpt2api-mysql \
+  mysql -ugpt2api gpt2api \
+  -e "UPDATE users SET role='admin' WHERE email='you@example.com';"
+```
+
+**② 重置某个用户的密码为已知明文**
+
+项目用 `golang.org/x/crypto/bcrypt`(cost=10)保存密码哈希,重置流程:
+
+```bash
+# 1) 在任意一台装了 Go 的机器上,用下面这段一次性小脚本把明文转成 bcrypt hash
+cd /tmp && mkdir bcgen && cd bcgen && go mod init bcgen \
+  && go get golang.org/x/crypto/bcrypt
+cat > main.go <<'EOF'
+package main
+import ("fmt"; "os"; "golang.org/x/crypto/bcrypt")
+func main() {
+  h, _ := bcrypt.GenerateFromPassword([]byte(os.Args[1]), 10)
+  fmt.Println(string(h))
+}
+EOF
+go run . 'MyNewPassword@123'
+# 输出例如:$2a$10$ljpcvSGUybg8vN4Bd3zjBu1YlQipf/gkeWMOflGUvw7EoTfM4/t.i
+
+# 2) 把这个 hash 写进 users.password_hash(整行原样粘贴,带 $2a$...)
+docker exec -e MYSQL_PWD='<your_mysql_password>' gpt2api-mysql \
+  mysql -ugpt2api gpt2api -e "UPDATE users \
+    SET password_hash='\$2a\$10\$ljpcvSGUybg8vN4Bd3zjBu1YlQipf/gkeWMOflGUvw7EoTfM4/t.i' \
+    WHERE email='you@example.com';"
+
+# 3) 用新密码 MyNewPassword@123 登录即可。
+```
+
+bcrypt 同明文每次生成的 hash 不同都能互相校验,上面的 hash 字符串**只能对应明文 `MyNewPassword@123`**,换明文必须重跑 Step 1。
+</details>
+
+<details>
+<summary><b>Q9. 4K 出图看着像"糊了放大",没有更多细节?</b></summary>
+
+这是预期行为。`gpt2api` 的 4K / 2K 是**本地 Catmull-Rom 插值放大**,属于传统算法:只会让图像尺寸变大、边缘更平滑,**不会像 AI 超分那样补出新的纹理 / 毛发 / 发丝细节**。适合的场景:
+
+- 打印 / 海报 / 大屏展示,需要物理像素够大;
+- 原图已经细节充分(例如 `1792×1024` 的复杂场景),仅仅是想铺满 4K 显示器;
+- 不想引入额外的 GPU / 超分模型推理成本。
+
+如果你确实需要"补细节",请自行接入 Real-ESRGAN / SwinIR / GFPGAN 等 AI 超分模型(通常需要 GPU 或 ONNX Runtime),或等待后续 Roadmap 里的 M14。详细原理见 [8.2 4K / 2K 高清输出](#82-4k--2k-高清输出本地-catmull-rom-放大)。
+</details>
+
 ---
 
 ## 十三、Roadmap
@@ -649,11 +835,13 @@ chatgpt.com 的实际上游 slug 会随账号等级微调(例如 Plus 用 `gpt-5
 - [x] M5 积分钱包 + 易支付充值
 - [x] M6 管理后台(Vue 3)
 - [x] M7 风控熔断 + 图片签名代理
-- [x] M8 IMG2 灰度命中 + 多图聚合
-- [ ] M9 Turnstile solver 接入 → 恢复文字通路
-- [ ] M10 图片任务大批量 Worker 池
-- [ ] M11 账号分组(按灰度等级 / 地区分配)
-- [ ] M12 Prometheus 指标 + Grafana 大盘
+- [x] M8 IMG2 终稿直出 + 多图聚合
+- [x] M9 本地 2K/4K 高清放大(Catmull-Rom + LRU 缓存)
+- [ ] M10 Turnstile solver 接入 → 恢复文字通路
+- [ ] M11 图片任务大批量 Worker 池
+- [ ] M12 账号分组(按出图成功率 / 地区分配)
+- [ ] M13 Prometheus 指标 + Grafana 大盘
+- [ ] M14 对接 Real-ESRGAN 等 AI 超分作为 4K 放大的可选后端
 
 ---
 

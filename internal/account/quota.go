@@ -106,13 +106,14 @@ func (q *QuotaProber) Run(ctx context.Context) {
 	case <-time.After(10 * time.Second):
 	}
 
-	for {
-		// 最小扫描间隔 60s;实际复用探测最小间隔的 1/3 做节奏,至少 60s
-		interval := time.Duration(q.settings.AccountQuotaProbeIntervalSec()/3) * time.Second
-		if interval < 60*time.Second {
-			interval = 60 * time.Second
-		}
+	// 扫描循环固定 60s 一轮。注意"扫描周期"和"账号探测最小间隔"是两件事:
+	//   - 扫描周期 = prober goroutine 多久检查一次 DB,有没有候选要打;
+	//   - 探测最小间隔 = 同一账号两次探测之间的最短间隔(5h,由 DAO SQL 决定)。
+	// 绑定后者会让 5h 场景下每 100 分钟才扫一次 → "额度=0 补探"分支最长延迟 100 分钟,
+	// 达不到用户想要的"归零后尽快更新"。固定 60s 扫描 + SQL WHERE 过滤几乎零成本。
+	const scanInterval = 60 * time.Second
 
+	for {
 		if q.settings.AccountQuotaProbeEnabled() {
 			q.scanOnce(ctx)
 		}
@@ -120,7 +121,7 @@ func (q *QuotaProber) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(interval):
+		case <-time.After(scanInterval):
 		case <-q.kick:
 		}
 	}

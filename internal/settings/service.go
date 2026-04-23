@@ -250,8 +250,11 @@ func (s *Service) ProbeTimeoutSec() int {
 	}
 	return n
 }
+// ProbeTargetURL 返回管理员配置的探测目标原值。
+// 留空不再在此层硬塞 gstatic,而是把"空"的语义向下透传给 Prober,
+// 由 Prober 走内置候选链(见 defaultProbeTargets)。
 func (s *Service) ProbeTargetURL() string {
-	return firstNonEmpty(s.GetString(ProxyProbeTargetURL), "https://www.gstatic.com/generate_204")
+	return strings.TrimSpace(s.GetString(ProxyProbeTargetURL))
 }
 func (s *Service) ProbeConcurrency() int {
 	n := int(s.GetInt(ProxyProbeConcurrency))
@@ -294,7 +297,7 @@ func (s *Service) AccountQuotaProbeEnabled() bool { return s.GetBool(AccountQuot
 func (s *Service) AccountQuotaProbeIntervalSec() int {
 	n := int(s.GetInt(AccountQuotaProbeIntervalSec))
 	if n <= 0 {
-		return 900
+		return 18000 // 5h
 	}
 	return n
 }

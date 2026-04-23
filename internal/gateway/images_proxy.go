@@ -23,6 +23,8 @@ package gateway
 
 import (
 	"context"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
@@ -35,6 +37,14 @@ import (
 	"github.com/432539/gpt2api/internal/upstream/chatgpt"
 	"github.com/432539/gpt2api/pkg/logger"
 )
+
+// imageUpscaleCache 进程级单例 LRU,用于缓存「原图 → 4K/2K PNG」的放大结果。
+// 首次请求某张图的 4K 会花费一次 decode + Catmull-Rom + png encode(约 0.5~1.5s),
+// 之后同一条代理 URL 的请求毫秒级命中,不会重复计算。
+//
+// 放大不会写回 image_tasks / file system —— 所有放大字节都只存在于当前进程的
+// LRU 里,服务重启即销毁,保证磁盘占用为 0。
+var imageUpscaleCache = image.NewUpscaleCache(0, 0)
 
 // ImageAccountResolver 按账号 ID 解出构造 chatgpt client 所需的敏感字段。
 // 由 main.go 注入。接口里不直接依赖 account 包,保持本层解耦。
@@ -78,6 +88,7 @@ func (h *ImagesHandler) ImageProxy(c *gin.Context) {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
+	scale := image.ValidateUpscale(t.Upscale)
 	outputs, _ := h.DAO.ListOutputs(c.Request.Context(), taskID)
 	if idx < len(outputs) {
 		out := outputs[idx]
@@ -92,10 +103,18 @@ func (h *ImagesHandler) ImageProxy(c *gin.Context) {
 			if ct == "" {
 				ct = "image/png"
 			}
-			c.Header("Cache-Control", "private, max-age=1800")
-			c.Data(http.StatusOK, ct, body)
+			serveTaskImageBytes(c, taskID, idx, scale, body, ct)
 			return
 		case "remote_url":
+			if scale != "" {
+				body, ct, err := fetchRemoteImage(c.Request.Context(), out.SourceRef)
+				if err != nil {
+					c.AbortWithStatus(http.StatusBadGateway)
+					return
+				}
+				serveTaskImageBytes(c, taskID, idx, scale, body, ct)
+				return
+			}
 			http.Redirect(c.Writer, c.Request, out.SourceRef, http.StatusTemporaryRedirect)
 			return
 		case "chatgpt_ref":
@@ -158,6 +177,69 @@ func (h *ImagesHandler) ImageProxy(c *gin.Context) {
 	if ct == "" {
 		ct = "image/png"
 	}
+	serveTaskImageBytes(c, taskID, idx, scale, body, ct)
+}
+
+func serveTaskImageBytes(c *gin.Context, taskID string, idx int, scale string, body []byte, ct string) {
+	if ct == "" {
+		ct = "image/png"
+	}
+	if scale != "" {
+		cacheKey := fmt.Sprintf("%s|%d|%s", taskID, idx, scale)
+		if data, ctCache, ok := imageUpscaleCache.Get(cacheKey); ok {
+			c.Header("Cache-Control", "private, max-age=3600")
+			c.Header("X-Upscale", scale+";cache=hit")
+			c.Data(http.StatusOK, ctCache, data)
+			return
+		}
+		imageUpscaleCache.Acquire()
+		upBytes, upCT, err := image.DoUpscale(body, scale)
+		imageUpscaleCache.Release()
+		if err != nil {
+			logger.L().Warn("image proxy upscale",
+				zap.Error(err), zap.String("task_id", taskID),
+				zap.String("scale", scale))
+			// 放大失败:回落到原图,不让用户看到白屏
+			c.Header("Cache-Control", "private, max-age=1800")
+			c.Header("X-Upscale", scale+";err")
+			c.Data(http.StatusOK, ct, body)
+			return
+		}
+		if upCT != "" {
+			ct = upCT
+		}
+		if len(upBytes) > 0 {
+			body = upBytes
+			imageUpscaleCache.Put(cacheKey, body, ct)
+			c.Header("X-Upscale", scale+";cache=miss")
+		} else {
+			// DoUpscale 也可能因"原图长边已足够大"而直接返回原字节
+			c.Header("X-Upscale", scale+";noop")
+		}
+		c.Header("Cache-Control", "private, max-age=3600")
+		c.Data(http.StatusOK, ct, body)
+		return
+	}
 	c.Header("Cache-Control", "private, max-age=1800")
 	c.Data(http.StatusOK, ct, body)
+}
+
+func fetchRemoteImage(ctx context.Context, rawURL string) ([]byte, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	res, err := (&http.Client{Timeout: 60 * time.Second}).Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode >= 400 {
+		return nil, "", fmt.Errorf("remote image http=%d", res.StatusCode)
+	}
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, "", err
+	}
+	return body, res.Header.Get("Content-Type"), nil
 }

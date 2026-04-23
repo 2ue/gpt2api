@@ -14,6 +14,21 @@ import (
 	"go.uber.org/zap"
 )
 
+// defaultProbeTargets 是用户 `proxy.probe_target_url` 留空时后台轮询的**候选链**。
+//
+// 设计目标:
+//   - 三个**不同厂商**的轻量接口,被同一条代理同时 Block 的概率极低
+//   - 响应体都 < 1 KB,走 2xx/3xx(非 204 也接受,见 probe 里 status 判断)
+//   - HTTPS / HTTP 混合,避免遇到 TLS MITM / 明文被劫持都能暴露其中一类问题
+//   - 任意 1 个通过即判代理可用,全部失败才标失败 → 根治"gstatic 被 ISP/代理屏蔽就误判代理挂掉"
+//
+// 顺序有讲究:响应小且稳定的放前面,拿到 200 就短路。
+var defaultProbeTargets = []string{
+	"https://api.ipify.org/?format=json",
+	"https://www.cloudflare.com/cdn-cgi/trace",
+	"http://httpbin.org/ip",
+}
+
 // ProbeSettings 探测器配置提供者(从 settings.Service 注入)。
 // 所有字段都支持热更新:循环每轮结束都会重新读取。
 type ProbeSettings interface {
@@ -189,6 +204,10 @@ func (p *Prober) probeBatch(ctx context.Context, list []*Proxy) []ProbeResult {
 }
 
 // probe 做一次真实 HTTP(S) 请求。只组装结果,不写库。
+//
+// 目标选择:
+//   - 管理员在「系统设置 → 代理探测目标 URL」配置了非空值 → 只试那一个(遵从运维意图)
+//   - 留空 → 按 defaultProbeTargets 顺序轮询,任意 1 个 2xx/3xx 即判成功,全部失败才算失败
 func (p *Prober) probe(ctx context.Context, pr *Proxy) ProbeResult {
 	out := ProbeResult{ProxyID: pr.ID, TriedAt: time.Now()}
 
@@ -208,13 +227,49 @@ func (p *Prober) probe(ctx context.Context, pr *Proxy) ProbeResult {
 		timeout = 10 * time.Second
 	}
 
-	target := strings.TrimSpace(p.settings.ProbeTargetURL())
-	if target == "" {
-		target = "https://www.gstatic.com/generate_204"
+	targets := p.candidateTargets()
+	var triedErrs []string
+	for _, target := range targets {
+		ok, lat, perr := p.probeOneTarget(ctx, u, target, timeout)
+		if ok {
+			out.OK = true
+			out.LatencyMs = lat
+			out.Duration = time.Duration(lat) * time.Millisecond
+			return out
+		}
+		triedErrs = append(triedErrs,
+			fmt.Sprintf("%s → %s", shortTargetHost(target), shortenErr(perr)))
 	}
 
+	// 所有候选都失败
+	switch len(triedErrs) {
+	case 0:
+		out.Error = "未配置任何探测目标"
+	case 1:
+		// 单目标(用户显式配置)直接透出友好文案,不要加 "1 个候选全部失败" 的啰嗦前缀
+		out.Error = firstErrMsg(triedErrs[0])
+	default:
+		out.Error = fmt.Sprintf("%d 个探测目标均不通(任一通过即判可用);%s",
+			len(triedErrs), strings.Join(triedErrs, "; "))
+	}
+	return out
+}
+
+// candidateTargets 返回本次需要轮询的目标 URL 列表。
+//   - 用户配置了非空 probe_target_url → 尊重配置,只用那一个
+//   - 配置为空 → 走内置候选链 defaultProbeTargets
+func (p *Prober) candidateTargets() []string {
+	if t := strings.TrimSpace(p.settings.ProbeTargetURL()); t != "" {
+		return []string{t}
+	}
+	return defaultProbeTargets
+}
+
+// probeOneTarget 对单个目标 URL 做一次 HTTP GET。
+// 返回:(是否 2xx/3xx, 延迟毫秒, 若失败的底层 error)。
+func (p *Prober) probeOneTarget(ctx context.Context, proxyU *url.URL, target string, timeout time.Duration) (bool, int, error) {
 	transport := &http.Transport{
-		Proxy:                 http.ProxyURL(u),
+		Proxy:                 http.ProxyURL(proxyU),
 		DialContext:           (&net.Dialer{Timeout: timeout}).DialContext,
 		TLSHandshakeTimeout:   timeout,
 		ResponseHeaderTimeout: timeout,
@@ -231,29 +286,38 @@ func (p *Prober) probe(ctx context.Context, pr *Proxy) ProbeResult {
 
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, target, nil)
 	if err != nil {
-		out.Error = "构造探测请求失败:" + err.Error()
-		return out
+		return false, 0, fmt.Errorf("build request: %w", err)
 	}
 	req.Header.Set("User-Agent", "gpt2api-proxy-prober/1.0")
 
 	start := time.Now()
 	resp, err := client.Do(req)
-	elapsed := time.Since(start)
-	out.Duration = elapsed
-	out.LatencyMs = int(elapsed / time.Millisecond)
-
+	lat := int(time.Since(start) / time.Millisecond)
 	if err != nil {
-		out.Error = shortenErr(err)
-		return out
+		return false, lat, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-		out.OK = true
-		return out
+		return true, lat, nil
 	}
-	out.Error = fmt.Sprintf("目标站返回异常状态码 %d", resp.StatusCode)
-	return out
+	return false, lat, fmt.Errorf("目标站返回异常状态码 %d", resp.StatusCode)
+}
+
+// shortTargetHost 给错误摘要用,把 URL 压成 "host" 短字符串。
+func shortTargetHost(target string) string {
+	if u, err := url.Parse(target); err == nil && u.Host != "" {
+		return u.Host
+	}
+	return target
+}
+
+// firstErrMsg 去掉 `host → ` 前缀,把单目标错误回到纯文案形态。
+func firstErrMsg(line string) string {
+	if i := strings.Index(line, " → "); i >= 0 && i+len(" → ") < len(line) {
+		return line[i+len(" → "):]
+	}
+	return line
 }
 
 func (p *Prober) applyResult(ctx context.Context, pr *Proxy, r ProbeResult) {
@@ -320,15 +384,23 @@ func shortenErr(err error) string {
 	case strings.Contains(low, "host is down"):
 		return "目标主机不可达"
 
-	// 连接在握手/发送中被对端断开
+	// 连接在握手/发送中被对端断开 —— 原因有多种,不要把结论钉死在"鉴权错误"
 	case strings.Contains(low, "connection reset by peer"):
-		return "对端重置连接(代理可能限流/拒绝)"
+		return "对端重置连接(目标站限流、代理线路抖动或鉴权都可能,换个探测目标再看)"
 	case strings.Contains(low, "broken pipe"):
-		return "连接已断开(broken pipe)"
+		return "连接已断开(broken pipe;代理线路抖动可能性大)"
 	case strings.Contains(low, "unexpected eof"),
 		low == "eof",
-		strings.HasSuffix(low, ": eof"):
-		return "代理握手被关闭(鉴权或协议不匹配)"
+		strings.HasSuffix(low, ": eof"),
+		strings.Contains(low, "remotedisconnected"),
+		strings.Contains(low, "connection closed"):
+		// 注意:HTTPS 握手前被对端 RST/FIN 很多情形都会报 EOF,不要单一归因为"鉴权失败"。
+		// 常见原因按概率排序:
+		//   1) 目标站对此出口 IP / UA / ALPN 做了限制(比如 gstatic 在部分区域直接丢包)
+		//   2) 代理自身到目标站的链路抖动 / 节点降级
+		//   3) 代理鉴权失败(较少见,多数情况 407 就返回了)
+		// 所以文案里把"鉴权"降到最后,给运维留个排障方向。
+		return "连接被对端提前关闭(EOF);可能原因:① 目标站限制此出口 IP ② 代理线路抖动 ③ 鉴权失败。建议在「系统设置」把探测目标留空以走内置候选链"
 
 	// 代理协议问题
 	case strings.Contains(low, "proxyconnect tcp"):

@@ -6,14 +6,66 @@
 2. 跑 `goose up` 应用所有迁移(包含用户表、账号池、审计、备份元数据等)
 3. 启动 HTTP 服务(`:8080`)
 
+## ⚠️ 架构说明:宿主预编译 + 容器运行
+
+本仓库的 `Dockerfile` 是**零外网依赖的"预构建 + 运行时"镜像**(规避国内拉 `proxy.golang.org` / `npm registry` 卡死)。  
+镜像里**不会**帮你 `go build` / `npm install`,而是直接 `COPY` 宿主机上已经编译好的三个产物:
+
+| 产物 | 路径 |
+|------|------|
+| 后端(linux/amd64) | `deploy/bin/gpt2api` |
+| 迁移工具(linux/amd64) | `deploy/bin/goose` |
+| 前端 Vite 产物 | `web/dist/` |
+
+所以**第一次部署 / 代码更新后,都要先在宿主机跑一次预编译脚本**,再 `docker compose build server`。
+
 ## 快速开始
+
+### 0. 宿主机准备
+
+需要提前装好:**Go 1.22+**、**Node 18+ / 20 LTS**、**Docker 24+**、**docker compose v2**。
+
+> 建议配镜像加速:  
+> `go env -w GOPROXY=https://goproxy.cn,direct`  
+> `npm config set registry https://registry.npmmirror.com`
+
+### 1. 预编译(必做一次)
+
+一条命令搞定后端 + goose + 前端三个产物:
+
+```bash
+# Linux / macOS / WSL
+bash deploy/build-local.sh
+
+# Windows PowerShell
+powershell -NoProfile -File deploy\build-local.ps1
+```
+
+结束后检查:
+
+```bash
+ls -lh deploy/bin/gpt2api deploy/bin/goose web/dist/index.html
+```
+
+### 2. 配置与启动
 
 ```bash
 cd deploy
 cp .env.example .env           # 修改 JWT_SECRET / CRYPTO_AES_KEY / MySQL 密码
-docker compose up -d --build
+docker compose build server    # 把刚才的产物 COPY 进镜像
+docker compose up -d
 docker compose logs -f server  # 观察迁移 + 启动日志
 ```
+
+### 3. 日常更新
+
+| 场景 | 做什么 |
+|------|--------|
+| 只改了前端 | `cd web && npm run build` → `cd ../deploy && docker compose build server && docker compose up -d server` |
+| 只改了后端 | `bash deploy/build-local.sh` → `cd deploy && docker compose build server && docker compose up -d server` |
+| `git pull` 新版 | `bash deploy/build-local.sh` → `docker compose build server && docker compose up -d server` |
+| 只改了 `.env` | `docker compose up -d`(环境变量变化 compose 会自动感知并重建容器) |
+| 想秒重启 | `docker compose restart server` |
 
 默认暴露端口:
 

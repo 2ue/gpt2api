@@ -15,12 +15,18 @@ import { useUserStore } from '@/stores/user'
  * 真正的守门人在后端 middleware.RequirePerm,前端只是体验优化。
  */
 const routes: RouteRecordRaw[] = [
+  // 首页:自带导航 + hero + 界面预览 + 技术栈 + 部署 + 完整 footer,
+  // 不套 BlankLayout(避免 BlankLayout 的简短广告 footer 和 Home 自身的 footer 重复)。
+  {
+    path: '/',
+    component: () => import('@/views/landing/Home.vue'),
+    meta: { public: true, title: 'GPT2API · ChatGPT 兼容 SaaS 网关 · IMG2 终稿直出 · 批量出图' },
+  },
   {
     path: '/',
     component: BlankLayout,
     meta: { public: true },
     children: [
-      { path: '', redirect: '/personal/dashboard' },
       { path: 'login', component: () => import('@/views/auth/Login.vue'), meta: { public: true, title: '登录' } },
       { path: 'register', component: () => import('@/views/auth/Register.vue'), meta: { public: true, title: '注册' } },
     ],

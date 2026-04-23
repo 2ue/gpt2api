@@ -58,12 +58,26 @@ http.interceptors.response.use(
     const status = error.response?.status
     const msg = error.response?.data?.message || error.message || '网络错误'
     if (status === 401) {
-      localStorage.removeItem(TOKEN_KEY)
-      localStorage.removeItem(REFRESH_KEY)
-      // 防止多次弹窗
-      if (!window.location.pathname.startsWith('/login')) {
-        ElMessage.warning('登录已失效,请重新登录')
-        window.location.href = `/login?redirect=${encodeURIComponent(window.location.pathname)}`
+      // 登录接口 401 = 账号密码错误,不要清 token 也不要跳转,直接给明确提示。
+      // 后端返回的是英文 "invalid email or password",这里本地化为中文。
+      const reqUrl = (error.config?.url || '') as string
+      const isLoginEndpoint =
+        reqUrl.includes('/auth/login') || reqUrl.includes('/auth/register')
+      if (isLoginEndpoint) {
+        const friendly =
+          /invalid email or password/i.test(msg) ? '邮箱或密码错误' : msg || '登录失败'
+        ElMessage.error(friendly)
+      } else {
+        localStorage.removeItem(TOKEN_KEY)
+        localStorage.removeItem(REFRESH_KEY)
+        if (!window.location.pathname.startsWith('/login')) {
+          ElMessage.warning('登录已失效,请重新登录')
+          window.location.href = `/login?redirect=${encodeURIComponent(window.location.pathname)}`
+        } else {
+          // 极端情况:已经在 /login 但又收到 401(例如 me 接口),给一条兜底 toast,
+          // 避免用户看到"点了没反应"。
+          ElMessage.error(msg || '登录已失效')
+        }
       }
     } else if (status === 403) {
       ElMessage.error(`无权限:${msg}`)

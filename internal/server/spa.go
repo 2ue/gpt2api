@@ -30,19 +30,23 @@ func mountSPA(r *gin.Engine) bool {
 		return false
 	}
 
-	// 静态资源(/assets/** 等)
-	r.Static("/assets", filepath.Join(dir, "assets"))
-
-	// 常见的"在根下"的单文件
-	registerRootFile := func(name string) {
-		p := filepath.Join(dir, name)
-		if _, err := os.Stat(p); err == nil {
-			r.StaticFile("/"+name, p)
+	// 自动挂载 dist/ 根下的所有子目录为静态资源(/assets、/screenshots、未来可能的 /img 等),
+	// 避免"加了 public/xxx 但后端忘注册 → 请求被 NoRoute 吞成 index.html"的坑。
+	// 同时把所有根层普通文件(favicon、robots.txt、manifest 等)也一并注册。
+	// 注意:index.html 不走 StaticFile,单独由 r.GET("/") 处理。
+	entries, _ := os.ReadDir(dir)
+	for _, ent := range entries {
+		name := ent.Name()
+		if name == "" || name == "." || name == ".." {
+			continue
+		}
+		full := filepath.Join(dir, name)
+		if ent.IsDir() {
+			r.Static("/"+name, full)
+		} else if name != "index.html" {
+			r.StaticFile("/"+name, full)
 		}
 	}
-	registerRootFile("favicon.svg")
-	registerRootFile("favicon.ico")
-	registerRootFile("robots.txt")
 
 	// 根路径直接返回 index.html,而不是 404。
 	r.GET("/", func(c *gin.Context) { c.File(indexPath) })

@@ -255,12 +255,71 @@ function renderMarkdown(raw: string): string {
 // ====================================================
 // 文生图(Text2Img)
 // ====================================================
+
+// 10 档比例:对应上游 chatgpt.com 实际靠 prompt 第一行 "Make the aspect ratio X:Y , "
+// 控制画面比例。OpenAI 兼容 size 仅作占位,按宽高比就近映射到官方支持的三档。
+interface RatioOpt {
+  label: string      // 中文名:方形 / 宽屏 / 竖版 …
+  ratio: string      // 比例文本:1:1 / 21:9 …
+  w: number          // 宽
+  h: number          // 高
+  size: string       // 发给后端的 OpenAI size
+}
+const RATIOS: readonly RatioOpt[] = [
+  { label: '方形',   ratio: '1:1',  w: 1,  h: 1,  size: '1024x1024' },
+  { label: '横屏',   ratio: '5:4',  w: 5,  h: 4,  size: '1792x1024' },
+  { label: '故事',   ratio: '9:16', w: 9,  h: 16, size: '1024x1792' },
+  { label: '超宽屏', ratio: '21:9', w: 21, h: 9,  size: '1792x1024' },
+  { label: '宽屏',   ratio: '16:9', w: 16, h: 9,  size: '1792x1024' },
+  { label: '横屏',   ratio: '4:3',  w: 4,  h: 3,  size: '1792x1024' },
+  { label: '宽幅',   ratio: '3:2',  w: 3,  h: 2,  size: '1792x1024' },
+  { label: '标准',   ratio: '4:5',  w: 4,  h: 5,  size: '1024x1792' },
+  { label: '竖版',   ratio: '3:4',  w: 3,  h: 4,  size: '1024x1792' },
+  { label: '竖版',   ratio: '2:3',  w: 2,  h: 3,  size: '1024x1792' },
+] as const
+
+// 预览小框的尺寸(按比例缩放后的 CSS px),保证所有档都落在 ≤36x36 的方格内。
+function ratioBoxStyle(r: RatioOpt) {
+  const MAX = 36
+  const ar = r.w / r.h
+  const bw = ar >= 1 ? MAX : Math.round(MAX * ar)
+  const bh = ar >= 1 ? Math.round(MAX / ar) : MAX
+  return { width: `${bw}px`, height: `${bh}px` }
+}
+
+// 统一的 prompt 前缀同步工具:
+// - 若第一行已经是 "Make the aspect ratio X:Y ,",就把 X:Y 换成新的 ratio
+// - 否则把 "Make the aspect ratio {ratio} , " 插到最前面
+// - 用户手动删掉这行后不会再自动补回(只有再次切换比例时才重新插入)
+const RATIO_PREFIX_RE = /^\s*Make the aspect ratio\s+\S+\s*,\s*/i
+function applyRatioPrefix(prompt: string, ratio: string): string {
+  const prefix = `Make the aspect ratio ${ratio} , `
+  const lines = prompt.split(/\r?\n/)
+  if (lines.length > 0 && RATIO_PREFIX_RE.test(lines[0])) {
+    lines[0] = lines[0].replace(RATIO_PREFIX_RE, prefix)
+    return lines.join('\n')
+  }
+  return prefix + prompt
+}
+
 const t2iPrompt = ref('')
-const t2iSize = ref<'1024x1024' | '1792x1024' | '1024x1792'>('1024x1024')
+const t2iRatio = ref<string>('1:1')
+const t2iSize = computed(() =>
+  RATIOS.find((r) => r.ratio === t2iRatio.value)?.size ?? '1024x1024',
+)
 const t2iN = ref(1)
+// 本地高清放大档位(空=原图 / '2k' / '4k')。
+// 仅在图片代理 URL 首次请求时触发 decode + Catmull-Rom + PNG 编码,
+// 进程内 LRU 缓存命中后毫秒级返回。
+type UpscaleLevel = '' | '2k' | '4k'
+const t2iUpscale = ref<UpscaleLevel>('')
+
+// 切换比例时,实时把 prompt 第一行同步成新的 "Make the aspect ratio X:Y , "
+watch(t2iRatio, (nv) => {
+  t2iPrompt.value = applyRatioPrefix(t2iPrompt.value, nv)
+})
 const t2iSending = ref(false)
 const t2iResult = ref<PlayImageData[]>([])
-const t2iPreview = ref(false)
 const t2iError = ref('')
 const t2iAbort = ref<AbortController | null>(null)
 
@@ -270,6 +329,11 @@ const imgExamples = [
   '极简几何海报,蓝橙配色,主体是一只展翅的鹤',
   '童话风格蘑菇屋,黄昏光线,柔和景深',
 ]
+
+// 点击示例 prompt 时,自动把当前比例的前缀拼到最前面,保持和 ratio 同步
+function useT2iExample(p: string) {
+  t2iPrompt.value = applyRatioPrefix(p, t2iRatio.value)
+}
 
 async function sendText2Img() {
   const prompt = t2iPrompt.value.trim()
@@ -283,7 +347,6 @@ async function sendText2Img() {
   }
   t2iSending.value = true
   t2iError.value = ''
-  t2iPreview.value = false
   t2iResult.value = []
   t2iAbort.value = new AbortController()
   try {
@@ -293,15 +356,13 @@ async function sendText2Img() {
         prompt,
         n: t2iN.value,
         size: t2iSize.value,
+        upscale: t2iUpscale.value || undefined,
       },
       t2iAbort.value.signal,
     )
     t2iResult.value = resp.data || []
-    t2iPreview.value = !!resp.is_preview
     if (t2iResult.value.length === 0) {
       t2iError.value = '未产出图片,请重试或更换描述'
-    } else if (t2iPreview.value) {
-      ElMessage.warning(`生成成功(预览模式):本次账号未命中 IMG2 灰度,展示的是 IMG1 预览图`)
     } else {
       ElMessage.success(`生成成功,共 ${t2iResult.value.length} 张`)
     }
@@ -350,10 +411,16 @@ interface RefImage {
 }
 const refImages = ref<RefImage[]>([])
 const i2iPrompt = ref('')
-const i2iSize = ref<'1024x1024' | '1792x1024' | '1024x1792'>('1024x1024')
+const i2iRatio = ref<string>('1:1')
+const i2iSize = computed(() =>
+  RATIOS.find((r) => r.ratio === i2iRatio.value)?.size ?? '1024x1024',
+)
+const i2iUpscale = ref<UpscaleLevel>('')
+watch(i2iRatio, (nv) => {
+  i2iPrompt.value = applyRatioPrefix(i2iPrompt.value, nv)
+})
 const i2iSending = ref(false)
 const i2iResult = ref<PlayImageData[]>([])
-const i2iPreview = ref(false)
 const i2iError = ref('')
 const i2iAbort = ref<AbortController | null>(null)
 const MAX_REF_BYTES = 4 * 1024 * 1024 // 4MB
@@ -399,7 +466,6 @@ async function sendImg2Img() {
   }
   i2iSending.value = true
   i2iError.value = ''
-  i2iPreview.value = false
   i2iResult.value = []
   i2iAbort.value = new AbortController()
   try {
@@ -410,13 +476,13 @@ async function sendImg2Img() {
         n: 1,
         size: i2iSize.value,
         reference_images: refImages.value.map((r) => r.dataUrl),
+        upscale: i2iUpscale.value || undefined,
       },
       i2iAbort.value.signal,
     )
     i2iResult.value = resp.data || []
-    i2iPreview.value = !!resp.is_preview
-    if (i2iPreview.value && i2iResult.value.length > 0) {
-      ElMessage.warning('生成成功(预览模式):本次账号未命中 IMG2 灰度,展示的是 IMG1 预览图')
+    if (i2iResult.value.length > 0) {
+      ElMessage.success(`生成成功,共 ${i2iResult.value.length} 张`)
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
@@ -669,27 +735,53 @@ watch(activeTab, (v) => {
             </div>
 
             <div class="side-row">
-              <label class="side-lbl">画面比例</label>
+              <label class="side-lbl">
+                画面比例
+                <span class="side-val">{{ t2iRatio }}</span>
+              </label>
               <div class="ratio-row">
                 <button
-                  v-for="opt in [
-                    { v: '1024x1024', l: '1:1',  w: 36, h: 36 },
-                    { v: '1792x1024', l: '16:9', w: 48, h: 28 },
-                    { v: '1024x1792', l: '9:16', w: 28, h: 48 },
-                  ]"
-                  :key="opt.v"
-                  :class="['ratio-btn', { active: t2iSize === opt.v }]"
-                  @click="t2iSize = opt.v as any"
+                  v-for="r in RATIOS"
+                  :key="r.ratio"
+                  :class="['ratio-btn', { active: t2iRatio === r.ratio }]"
+                  :title="`${r.label} · ${r.ratio}`"
+                  @click="t2iRatio = r.ratio"
                 >
-                  <div class="ratio-box" :style="{ width: opt.w + 'px', height: opt.h + 'px' }" />
-                  <span>{{ opt.l }}</span>
+                  <div class="ratio-box" :style="ratioBoxStyle(r)" />
+                  <span class="ratio-name">{{ r.label }}</span>
+                  <span class="ratio-val-sm">{{ r.ratio }}</span>
                 </button>
+              </div>
+              <div class="side-hint">
+                选中后会把 <code class="hint-code">Make the aspect ratio {{ t2iRatio }} ,</code>
+                作为 prompt 第一行传给上游
               </div>
             </div>
 
             <div class="side-row">
               <label class="side-lbl">张数 <span class="side-val">{{ t2iN }}</span></label>
               <el-slider v-model="t2iN" :min="1" :max="4" show-stops />
+            </div>
+
+            <div class="side-row">
+              <label class="side-lbl">
+                输出尺寸
+                <el-tooltip placement="top" effect="light">
+                  <template #content>
+                    <div style="max-width:260px;line-height:1.55;">
+                      上游原生出图为 1024 或 1792 px;选择 2K/4K 会在图片加载时用本地
+                      <b>Catmull-Rom 插值</b>放大并以 PNG 输出。<br>
+                      <span style="color:#a16207;">注意:这是传统算法放大,不是 AI 超分,</span>不会补出新的纹理或毛发,只会让画面更大更平滑。4K 首次加载约 +0.5~1.5s,之后命中缓存。
+                    </div>
+                  </template>
+                  <el-icon style="margin-left:4px;color:#94a3b8;cursor:help;"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </label>
+              <el-radio-group v-model="t2iUpscale" size="small" class="upscale-group">
+                <el-radio-button label="">原图</el-radio-button>
+                <el-radio-button label="2k">2K 高清</el-radio-button>
+                <el-radio-button label="4k">4K 高清</el-radio-button>
+              </el-radio-group>
             </div>
 
             <div class="side-row">
@@ -708,7 +800,7 @@ watch(activeTab, (v) => {
                   effect="plain"
                   round
                   class="chip"
-                  @click="t2iPrompt = p"
+                  @click="useT2iExample(p)"
                 >{{ p }}</el-tag>
               </div>
             </div>
@@ -745,25 +837,14 @@ watch(activeTab, (v) => {
               <div class="stage-sub">在左侧填好 prompt 和参数,点击「生成图片」</div>
             </div>
             <div v-else class="result-wrap">
-              <el-alert
-                v-if="t2iPreview"
-                class="preview-tip"
-                type="warning"
-                :closable="false"
-                show-icon
-                title="本次未使用 IMG2 灰度生成"
-                description="上游没有把本账号放入 IMG2 终稿通道,返回的是 IMG1 预览图;效果略简化,属于正常降级,可多试几次或更换账号。"
-              />
               <div class="result-grid">
                 <div
                   v-for="(img, idx) in t2iResult"
                   :key="idx"
                   class="img-cell"
-                  :class="{ 'is-preview': t2iPreview }"
                   @click="openPreview(t2iResult.map((x) => x.url), idx)"
                 >
                   <img :src="img.url" :alt="`result-${idx}`" loading="lazy" />
-                  <div v-if="t2iPreview" class="img-badge">IMG1 预览</div>
                   <div class="img-actions" @click.stop>
                     <button class="iact" @click="openPreview(t2iResult.map((x) => x.url), idx)">
                       <el-icon><ZoomIn /></el-icon>
@@ -817,22 +898,48 @@ watch(activeTab, (v) => {
             </div>
 
             <div class="side-row">
-              <label class="side-lbl">输出比例</label>
+              <label class="side-lbl">
+                输出比例
+                <span class="side-val">{{ i2iRatio }}</span>
+              </label>
               <div class="ratio-row">
                 <button
-                  v-for="opt in [
-                    { v: '1024x1024', l: '1:1',  w: 36, h: 36 },
-                    { v: '1792x1024', l: '16:9', w: 48, h: 28 },
-                    { v: '1024x1792', l: '9:16', w: 28, h: 48 },
-                  ]"
-                  :key="opt.v"
-                  :class="['ratio-btn', { active: i2iSize === opt.v }]"
-                  @click="i2iSize = opt.v as any"
+                  v-for="r in RATIOS"
+                  :key="r.ratio"
+                  :class="['ratio-btn', { active: i2iRatio === r.ratio }]"
+                  :title="`${r.label} · ${r.ratio}`"
+                  @click="i2iRatio = r.ratio"
                 >
-                  <div class="ratio-box" :style="{ width: opt.w + 'px', height: opt.h + 'px' }" />
-                  <span>{{ opt.l }}</span>
+                  <div class="ratio-box" :style="ratioBoxStyle(r)" />
+                  <span class="ratio-name">{{ r.label }}</span>
+                  <span class="ratio-val-sm">{{ r.ratio }}</span>
                 </button>
               </div>
+              <div class="side-hint">
+                切换后会把 <code class="hint-code">Make the aspect ratio {{ i2iRatio }} ,</code>
+                作为 prompt 第一行
+              </div>
+            </div>
+
+            <div class="side-row">
+              <label class="side-lbl">
+                输出尺寸
+                <el-tooltip placement="top" effect="light">
+                  <template #content>
+                    <div style="max-width:260px;line-height:1.55;">
+                      上游原生出图为 1024 或 1792 px;选择 2K/4K 会在图片加载时用本地
+                      <b>Catmull-Rom 插值</b>放大并以 PNG 输出。<br>
+                      <span style="color:#a16207;">注意:这是传统算法放大,不是 AI 超分,</span>不会补出新的纹理或毛发,只会让画面更大更平滑。4K 首次加载约 +0.5~1.5s,之后命中缓存。
+                    </div>
+                  </template>
+                  <el-icon style="margin-left:4px;color:#94a3b8;cursor:help;"><InfoFilled /></el-icon>
+                </el-tooltip>
+              </label>
+              <el-radio-group v-model="i2iUpscale" size="small" class="upscale-group">
+                <el-radio-button label="">原图</el-radio-button>
+                <el-radio-button label="2k">2K 高清</el-radio-button>
+                <el-radio-button label="4k">4K 高清</el-radio-button>
+              </el-radio-group>
             </div>
 
             <div class="side-row">
@@ -860,15 +967,6 @@ watch(activeTab, (v) => {
           </aside>
 
           <section class="card-block img-main">
-            <el-alert
-              type="warning"
-              :closable="false"
-              title="图生图目前处于 Preview"
-              description="上游 ChatGPT 文件上传协议还在接入,当前提交会返回 501。UI 已准备就绪,协议完成后即刻可用。"
-              show-icon
-              style="margin-bottom: 14px; border-radius: 10px;"
-            />
-
             <div v-if="i2iError" class="err-block">
               <el-icon><WarningFilled /></el-icon>
               {{ i2iError }}
@@ -883,25 +981,14 @@ watch(activeTab, (v) => {
               <div class="stage-sub">上传参考图 + 描述改动,然后点击「生成」</div>
             </div>
             <div v-else class="result-wrap">
-              <el-alert
-                v-if="i2iPreview"
-                class="preview-tip"
-                type="warning"
-                :closable="false"
-                show-icon
-                title="本次未使用 IMG2 灰度生成"
-                description="上游没有把本账号放入 IMG2 终稿通道,返回的是 IMG1 预览图。"
-              />
               <div class="result-grid">
                 <div
                   v-for="(img, idx) in i2iResult"
                   :key="idx"
                   class="img-cell"
-                  :class="{ 'is-preview': i2iPreview }"
                   @click="openPreview(i2iResult.map((x) => x.url), idx)"
                 >
                   <img :src="img.url" :alt="`result-${idx}`" />
-                  <div v-if="i2iPreview" class="img-badge">IMG1 预览</div>
                   <div class="img-actions" @click.stop>
                     <button class="iact" @click="openPreview(i2iResult.map((x) => x.url), idx)">
                       <el-icon><ZoomIn /></el-icon>
@@ -1033,6 +1120,16 @@ watch(activeTab, (v) => {
 .side-btn { margin-top: 4px; }
 .gen-btn { box-shadow: 0 6px 18px -6px rgba(64, 158, 255, 0.55); }
 .opt-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+
+/* ---- 输出尺寸(本地高清放大)单选组 ---- */
+.upscale-group { display: flex; width: 100%; }
+.upscale-group :deep(.el-radio-button) { flex: 1; }
+.upscale-group :deep(.el-radio-button__inner) {
+  width: 100%;
+  padding-left: 0;
+  padding-right: 0;
+  letter-spacing: 0.2px;
+}
 .opt-slug { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; }
 
 /* ====================== Chat ====================== */
@@ -1229,26 +1326,46 @@ watch(activeTab, (v) => {
 }
 .img-main { min-height: 560px; }
 
-/* 比例按钮 */
-.ratio-row { display: flex; gap: 8px; }
+/* 比例按钮 —— 10 档预设,5 列 × 2 行 grid */
+.ratio-row {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 6px;
+}
 .ratio-btn {
-  flex: 1;
   background: var(--el-bg-color);
   border: 1px solid var(--el-border-color-lighter);
-  border-radius: 10px;
-  padding: 10px 0 8px;
+  border-radius: 8px;
+  padding: 6px 2px 5px;
   cursor: pointer;
-  display: flex; flex-direction: column; align-items: center; gap: 6px;
-  font-size: 12px; color: var(--el-text-color-secondary);
+  display: flex; flex-direction: column; align-items: center;
+  gap: 3px;
+  font-size: 11px; color: var(--el-text-color-secondary);
   transition: all 0.15s;
+  min-width: 0;
   .ratio-box {
     background: var(--el-fill-color-light);
     border-radius: 2px;
     border: 1px solid var(--el-border-color-lighter);
+    flex: 0 0 auto;
+    /* 固定一个 36px 高度的占位,避免不同比例下按钮整体高度抖动 */
+    margin: 2px 0;
+  }
+  .ratio-name {
+    font-size: 11px;
+    line-height: 1.2;
+    letter-spacing: 0;
+  }
+  .ratio-val-sm {
+    font-size: 10px;
+    color: var(--el-text-color-placeholder);
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    line-height: 1.2;
   }
   &:hover {
     border-color: var(--el-color-primary);
     color: var(--el-color-primary);
+    .ratio-val-sm { color: var(--el-color-primary); }
   }
   &.active {
     border-color: var(--el-color-primary);
@@ -1259,7 +1376,18 @@ watch(activeTab, (v) => {
       background: var(--el-color-primary);
       border-color: var(--el-color-primary);
     }
+    .ratio-val-sm { color: var(--el-color-primary); font-weight: 600; }
   }
+}
+
+/* ratio 说明文字里的内联代码样式 */
+.hint-code {
+  background: var(--el-fill-color);
+  color: var(--el-color-primary);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 11.5px;
 }
 
 /* prompt chips */
@@ -1387,33 +1515,10 @@ watch(activeTab, (v) => {
   }
 }
 
-/* IMG1 预览兜底专用样式 */
 .result-wrap {
   display: flex; flex-direction: column; gap: 10px;
   padding: 4px;
   .result-grid { padding: 0; }
-  .preview-tip { border-radius: 10px; }
-}
-.img-cell.is-preview {
-  box-shadow: 0 2px 8px rgba(251, 146, 60, 0.25);
-  &::after {
-    content: ''; position: absolute; inset: 0;
-    border: 1.5px dashed rgba(245, 158, 11, 0.55);
-    border-radius: 12px;
-    pointer-events: none;
-  }
-}
-.img-badge {
-  position: absolute;
-  left: 8px; top: 8px;
-  padding: 2px 8px;
-  font-size: 11px;
-  border-radius: 999px;
-  background: rgba(245, 158, 11, 0.92);
-  color: #fff;
-  letter-spacing: 0.3px;
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
-  pointer-events: none;
 }
 
 /* ====================== Dark mode ====================== */

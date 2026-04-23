@@ -36,7 +36,7 @@ INSERT INTO `system_settings` (`k`, `v`, `description`) VALUES
     ('account.refresh_ahead_sec',        '900',                                  '距离过期多少秒内触发预刷新(建议 ≥ 300)'),
     ('account.refresh_concurrency',      '4',                                    '同时刷新的账号数(1~32)'),
     ('account.quota_probe_enabled',      'true',                                 '账号图片额度自动探测总开关'),
-    ('account.quota_probe_interval_sec', '900',                                  '额度探测最小间隔(秒)'),
+    ('account.quota_probe_interval_sec', '18000',                                '额度探测最小间隔(秒);默认 18000=5h,剩余额度=0 且已过重置时间会忽略此间隔立即补探'),
     ('account.default_client_id',        'app_EMoamEEZ73f0CkXaXp7hrann',         '导入账号时未指定 client_id 则使用此值')
 ON DUPLICATE KEY UPDATE `k` = VALUES(`k`);
 

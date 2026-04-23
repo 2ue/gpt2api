@@ -195,7 +195,11 @@ func (d *DAO) ListNeedRefresh(ctx context.Context, aheadSec int, limit int) ([]*
 	return rows, err
 }
 
-// ListNeedProbeQuota 返回需要探测图片额度的账号(上次探测超过 minIntervalSec 秒,或从未探测过)。
+// ListNeedProbeQuota 返回需要探测图片额度的账号。命中以下任一条件即纳入:
+//   (a) 从未探测过(image_quota_updated_at IS NULL);
+//   (b) 上次探测超过 minIntervalSec 秒(常规轮询);
+//   (c) **剩余额度=0 且已过 reset_at**:这种"归零等重置"的账号要第一时间补探,
+//       不受 minIntervalSec 限制,避免 5 小时轮询间隔导致的额度恢复滞后显示。
 func (d *DAO) ListNeedProbeQuota(ctx context.Context, minIntervalSec int, limit int) ([]*Account, error) {
 	rows := make([]*Account, 0, limit)
 	threshold := time.Now().Add(-time.Duration(minIntervalSec) * time.Second)
@@ -205,7 +209,12 @@ func (d *DAO) ListNeedProbeQuota(ctx context.Context, minIntervalSec int, limit 
            AND provider_kind = ?
            AND status = 'healthy'
            AND (token_expires_at IS NULL OR token_expires_at > NOW())
-           AND (image_quota_updated_at IS NULL OR image_quota_updated_at <= ?)
+           AND (
+                image_quota_updated_at IS NULL
+             OR image_quota_updated_at <= ?
+             OR (image_quota_remaining = 0
+                 AND (image_quota_reset_at IS NULL OR image_quota_reset_at <= NOW()))
+           )
          ORDER BY CASE WHEN image_quota_updated_at IS NULL THEN 0 ELSE 1 END,
                   image_quota_updated_at ASC
          LIMIT ?`, ProviderKindReverse, threshold, limit)

@@ -21,11 +21,11 @@ import (
 //	StreamFConversation (SSE) → ParseImageSSE → PollConversationForImages →
 //	ImageDownloadURL(签名 URL)
 //
-// 灰度桶未命中(preview_only)会自动换账号重试。
+// reverse 路径采用单轮 SSE + 短轮询,仅对账号级硬错误做跨账号重试。
 type Runner struct {
-	sched *scheduler.Scheduler
-	dao   *DAO
-	storage *Storage
+	sched    *scheduler.Scheduler
+	dao      *DAO
+	storage  *Storage
 	routeCfg ImageRouteConfigProvider
 }
 
@@ -49,14 +49,14 @@ type RunOptions struct {
 	ModelID           uint64
 	UpstreamModel     string // 默认 "auto"(由上游根据 system_hints 挑选图像模型)
 	Request           CanonicalRequest
-	MaxAttempts       int                // 灰度未命中时最大重试,默认 2
-	PerAttemptTimeout time.Duration      // 单次尝试总超时,默认 5min
-	PollMaxWait       time.Duration      // 轮询最长等待,默认 300s
+	MaxAttempts       int           // 最大跨账号尝试次数,默认 1
+	PerAttemptTimeout time.Duration // 单次尝试总超时,默认 2min
+	PollMaxWait       time.Duration // 轮询最长等待,默认 60s
 }
 
 // RunResult 是单次生图的输出。
 type RunResult struct {
-	Status         string   // success / failed
+	Status         string // success / failed
 	ConversationID string
 	AccountID      uint64
 	FileIDs        []string // chatgpt.com 侧的原始 ref("sed:" 前缀表示 sediment)
@@ -69,10 +69,10 @@ type RunResult struct {
 	Outputs        []TaskOutput
 	ErrorCode      string
 	ErrorMessage   string
-	Attempts       int   // 跨账号尝试次数(runOnce 次数)
+	Attempts       int // 跨账号尝试次数(runOnce 次数)
 	SwitchCount    int
-	TurnsInConv    int   // 当前账号内同会话 picture_v2 轮次
-	IsPreview      bool  // true=返回的是 IMG1 sediment 预览(3 轮均未命中 IMG2 灰度,已尽力)
+	TurnsInConv    int  // 兼容保留:旧版同会话多轮 picture_v2 计数
+	IsPreview      bool // 兼容保留:旧版 preview-only 兜底标记
 	DurationMs     int64
 }
 
@@ -84,13 +84,13 @@ func (r *Runner) runReverse(ctx context.Context, opt RunOptions) *RunResult {
 	start := time.Now()
 	opt.Request.Normalize()
 	if opt.MaxAttempts <= 0 {
-		opt.MaxAttempts = 2
+		opt.MaxAttempts = 1
 	}
 	if opt.PerAttemptTimeout <= 0 {
-		opt.PerAttemptTimeout = 5 * time.Minute
+		opt.PerAttemptTimeout = 2 * time.Minute
 	}
 	if opt.PollMaxWait <= 0 {
-		opt.PollMaxWait = 300 * time.Second
+		opt.PollMaxWait = 60 * time.Second
 	}
 	if opt.UpstreamModel == "" {
 		// 对齐浏览器抓包 + 参考实现:图像走 f/conversation 时 model 字段和
@@ -133,12 +133,14 @@ func (r *Runner) runReverse(ctx context.Context, opt RunOptions) *RunResult {
 		}
 		result.ErrorCode = status
 
-		// preview_only:换账号重试;其他错误直接退出
-		if status != ErrPreviewOnly {
+		// 仅对账号级硬错误做跨账号重试。
+		if status != ErrRateLimited && status != ErrNoAccount && status != ErrAuthRequired {
 			break
 		}
-		logger.L().Info("image runner preview_only, retry with another account",
-			zap.String("task_id", opt.TaskID), zap.Int("attempt", attempt))
+		logger.L().Info("image runner retry with another account",
+			zap.String("task_id", opt.TaskID),
+			zap.String("reason", status),
+			zap.Int("attempt", attempt))
 	}
 
 	result.DurationMs = time.Since(start).Milliseconds()
@@ -264,136 +266,76 @@ func (r *Runner) runOnce(ctx context.Context, opt RunOptions, result *RunResult)
 			zap.String("requested_model", opt.UpstreamModel))
 	}
 
-	// 5-7) 同账号 + 同会话多轮发起 picture_v2,命中 IMG2 即返回;
-	// 连续 sameConvMax 轮只拿到预览(preview_only)时,用最后一轮的 sediment 作为 IMG1 返回。
-	// 协议/网络级错误(非 preview_only)会直接退出,由外层 Run 换账号。
-	const sameConvMax = 3
+	// 5) 单轮 picture_v2:SSE 里直接给图就走 SSE 结果,没给就短轮询补齐。
+	convOpt := chatgpt.ImageConvOpts{
+		Prompt:        opt.Request.Prompt,
+		UpstreamModel: upstreamModel,
+		ConvID:        convID,
+		ParentMsgID:   parentID,
+		MessageID:     messageID,
+		ChatToken:     cr.Token,
+		ProofToken:    proofToken,
+		References:    refs,
+	}
 
-	var (
-		fileRefs        []string
-		lastPreviewFids []string
-		lastPreviewSids []string
-		previewRounds   int
-		// baselineTools 记录上一轮结束时会话里已有的 image_gen tool 消息 id,
-		// 下一轮 PollConversationForImages 只看新增,避免把旧 preview 当本轮结果。
-		baselineTools = map[string]struct{}{}
+	// Prepare(conduit_token;拿不到也能降级继续)
+	if ct, err := cli.PrepareFConversation(ctx, convOpt); err == nil {
+		convOpt.ConduitToken = ct
+	} else if ue, ok := err.(*chatgpt.UpstreamError); ok && ue.IsRateLimited() {
+		r.sched.MarkRateLimited(context.Background(), lease.Account.ID)
+		return false, ErrRateLimited, err
+	}
+
+	// f/conversation SSE
+	stream, err := cli.StreamFConversation(ctx, convOpt)
+	if err != nil {
+		code := r.classifyUpstream(err)
+		if code == ErrRateLimited {
+			r.sched.MarkRateLimited(context.Background(), lease.Account.ID)
+		}
+		return false, code, err
+	}
+	sseResult := chatgpt.ParseImageSSE(stream)
+	if sseResult.ConversationID != "" {
+		convID = sseResult.ConversationID
+		result.ConversationID = convID
+	}
+
+	logger.L().Info("image runner SSE parsed",
+		zap.String("task_id", opt.TaskID),
+		zap.Uint64("account_id", lease.Account.ID),
+		zap.String("conv_id", convID),
+		zap.String("finish_type", sseResult.FinishType),
+		zap.String("image_gen_task_id", sseResult.ImageGenTaskID),
+		zap.Int("sse_fids", len(sseResult.FileIDs)),
+		zap.Strings("sse_fids_list", sseResult.FileIDs),
+		zap.Int("sse_sids", len(sseResult.SedimentIDs)),
+		zap.Strings("sse_sids_list", sseResult.SedimentIDs),
 	)
 
-loop:
-	for turn := 1; turn <= sameConvMax; turn++ {
-		result.TurnsInConv = turn
+	var fileRefs []string
+	fileRefs = append(fileRefs, sseResult.FileIDs...)
+	for _, s := range sseResult.SedimentIDs {
+		fileRefs = append(fileRefs, "sed:"+s)
+	}
 
-		// 每轮重新拉 chat_token + proof_token(之前那张已经消耗过)。
-		// 复用外层 cr / proofToken 的首次结果(turn==1 直接用),后续重取。
-		if turn > 1 {
-			cr, err = cli.ChatRequirementsV2(ctx)
-			if err != nil {
-				return false, r.classifyUpstream(err), err
-			}
-			proofToken = ""
-			if cr.Proofofwork.Required {
-				proofCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
-				ch := make(chan string, 1)
-				go func() { ch <- cr.SolveProof(chatgpt.DefaultUserAgent) }()
-				select {
-				case <-proofCtx.Done():
-					cancel()
-					r.sched.MarkWarned(context.Background(), lease.Account.ID)
-					return false, ErrPOWTimeout, proofCtx.Err()
-				case proofToken = <-ch:
-					cancel()
-				}
-				if proofToken == "" {
-					r.sched.MarkWarned(context.Background(), lease.Account.ID)
-					return false, ErrPOWFailed, errors.New("pow solver returned empty")
-				}
-			}
-		}
-
-		convOpt := chatgpt.ImageConvOpts{
-			Prompt:        opt.Request.Prompt,
-			UpstreamModel: upstreamModel,
-			ConvID:        convID, // 第 1 轮空串=新会话,后续轮复用
-			ParentMsgID:   parentID,
-			MessageID:     messageID,
-			ChatToken:     cr.Token,
-			ProofToken:    proofToken,
-			References:    refs,
-		}
-		if turn > 1 {
-			// 续聊:每轮用新的 message_id,parent 来自上轮会话头
-			convOpt.MessageID = uuid.NewString()
-		}
-
-		// Prepare(conduit_token;不成功也能降级跑 conversation)
-		if ct, err := cli.PrepareFConversation(ctx, convOpt); err == nil {
-			convOpt.ConduitToken = ct
-		} else if ue, ok := err.(*chatgpt.UpstreamError); ok && ue.IsRateLimited() {
-			r.sched.MarkRateLimited(context.Background(), lease.Account.ID)
-			return false, ErrRateLimited, err
-		}
-
-		// f/conversation SSE
-		stream, err := cli.StreamFConversation(ctx, convOpt)
-		if err != nil {
-			code := r.classifyUpstream(err)
-			if code == ErrRateLimited {
-				r.sched.MarkRateLimited(context.Background(), lease.Account.ID)
-			}
-			return false, code, err
-		}
-		sseResult := chatgpt.ParseImageSSE(stream)
-		if sseResult.ConversationID != "" {
-			convID = sseResult.ConversationID
-			result.ConversationID = convID
-		}
-
-		// 每轮 SSE 解析完的原始产物:FileIDs(file-service://,IMG2 直出时有)、
-		// SedimentIDs(sediment://,preview 或 IMG1 常见)、FinishType。用于诊断
-		// "这轮到底返回了什么"。
-		logger.L().Info("image runner SSE parsed",
+	if len(fileRefs) >= opt.Request.N {
+		logger.L().Info("image runner enough refs from SSE, skip polling",
 			zap.String("task_id", opt.TaskID),
 			zap.Uint64("account_id", lease.Account.ID),
-			zap.Int("turn", turn),
 			zap.String("conv_id", convID),
-			zap.String("finish_type", sseResult.FinishType),
-			zap.String("image_gen_task_id", sseResult.ImageGenTaskID),
-			zap.Int("sse_fids", len(sseResult.FileIDs)),
-			zap.Strings("sse_fids_list", sseResult.FileIDs),
-			zap.Int("sse_sids", len(sseResult.SedimentIDs)),
-			zap.Strings("sse_sids_list", sseResult.SedimentIDs),
+			zap.Int("refs", len(fileRefs)),
+			zap.Strings("refs_list", fileRefs),
 		)
-
-		// SSE 直出 file-service = IMG2 命中。
-		// 注意:同一次灰度也可能同时带 sediment(例如 preview + final 各一张),
-		// 都要收进来,不然用户会少看到图。
-		if len(sseResult.FileIDs) > 0 {
-			fileRefs = append(fileRefs, sseResult.FileIDs...)
-			for _, s := range sseResult.SedimentIDs {
-				fileRefs = append(fileRefs, "sed:"+s)
-			}
-			logger.L().Info("image runner IMG2 direct hit (from SSE)",
-				zap.String("task_id", opt.TaskID),
-				zap.Uint64("account_id", lease.Account.ID),
-				zap.Int("turn", turn),
-				zap.String("conv_id", convID),
-				zap.Int("total_refs", len(fileRefs)),
-				zap.Strings("refs", fileRefs),
-			)
-			break loop
-		}
-
-		// 没直出就轮询当前会话
+	} else {
 		pollOpt := chatgpt.PollOpts{
-			MaxWait:         opt.PollMaxWait,
-			BaselineToolIDs: baselineTools,
+			ExpectedN: opt.Request.N,
+			MaxWait:   opt.PollMaxWait,
 		}
 		status, fids, sids := cli.PollConversationForImages(ctx, convID, pollOpt)
-		// 每轮 Poll 的产物,无论 status 如何都打印一条,用于诊断"第几轮拿到了什么"。
 		logger.L().Info("image runner poll done",
 			zap.String("task_id", opt.TaskID),
 			zap.Uint64("account_id", lease.Account.ID),
-			zap.Int("turn", turn),
 			zap.String("conv_id", convID),
 			zap.String("poll_status", string(status)),
 			zap.Int("poll_fids", len(fids)),
@@ -402,79 +344,35 @@ loop:
 			zap.Strings("poll_sids_list", sids),
 		)
 		switch status {
-		case chatgpt.PollStatusIMG2:
-			fileRefs = append(fileRefs, fids...)
-			for _, s := range sids {
-				fileRefs = append(fileRefs, "sed:"+s)
+		case chatgpt.PollStatusSuccess:
+			seen := make(map[string]struct{}, len(fileRefs))
+			for _, ref := range fileRefs {
+				seen[ref] = struct{}{}
 			}
-			logger.L().Info("image runner IMG2 poll hit",
-				zap.String("task_id", opt.TaskID),
-				zap.Uint64("account_id", lease.Account.ID),
-				zap.Int("turn", turn),
-				zap.String("conv_id", convID),
-				zap.Int("total_refs", len(fileRefs)),
-				zap.Strings("refs", fileRefs),
-			)
-			break loop
-
-		case chatgpt.PollStatusPreviewOnly:
-			previewRounds++
-			// 保留最新一轮的预览结果(3 轮都 preview 时作为 IMG1 兜底)
-			lastPreviewFids = fids
-			lastPreviewSids = sids
-			logger.L().Info("image runner preview_only, retry in same conversation",
-				zap.String("task_id", opt.TaskID),
-				zap.Uint64("account_id", lease.Account.ID),
-				zap.String("conv_id", convID),
-				zap.Int("turn", turn),
-				zap.Int("max_turns", sameConvMax),
-				zap.Int("preview_fids", len(fids)),
-				zap.Strings("preview_fids_list", fids),
-				zap.Int("preview_sids", len(sids)),
-				zap.Strings("preview_sids_list", sids),
-			)
-
-			// 不是最后一轮:更新 baseline + 取会话头作为下轮的 parent_message_id
-			if turn < sameConvMax {
-				if mapping, merr := cli.GetConversationMapping(ctx, convID); merr == nil {
-					// 把当前所有 tool 消息都塞进 baseline,下轮 poll 只看新增
-					if newBL := buildToolBaseline(mapping); newBL != nil {
-						baselineTools = newBL
-					}
-					if head, _ := mapping["current_node"].(string); head != "" {
-						parentID = head
-					}
-				} else {
-					logger.L().Warn("image runner fetch mapping for retry failed",
-						zap.Uint64("account_id", lease.Account.ID), zap.Error(merr))
+			for _, fid := range fids {
+				if _, ok := seen[fid]; ok {
+					continue
 				}
+				seen[fid] = struct{}{}
+				fileRefs = append(fileRefs, fid)
 			}
-
+			for _, sid := range sids {
+				key := "sed:" + sid
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				fileRefs = append(fileRefs, key)
+			}
 		case chatgpt.PollStatusTimeout:
-			return false, ErrPollTimeout, errors.New("poll timeout")
-
+			return false, ErrPollTimeout, errors.New("poll timeout without any image")
 		default:
 			return false, ErrUpstream, errors.New("poll error")
 		}
 	}
 
-	// 若循环结束仍未拿到 IMG2,用最后一轮预览做 IMG1 兜底
 	if len(fileRefs) == 0 {
-		if len(lastPreviewFids) == 0 && len(lastPreviewSids) == 0 {
-			return false, ErrPreviewOnly, errors.New("no image ref produced")
-		}
-		result.IsPreview = true
-		fileRefs = append(fileRefs, lastPreviewFids...)
-		for _, s := range lastPreviewSids {
-			fileRefs = append(fileRefs, "sed:"+s)
-		}
-		logger.L().Warn("image runner fallback to IMG1 preview after exhausting retries",
-			zap.String("task_id", opt.TaskID),
-			zap.Uint64("account_id", lease.Account.ID),
-			zap.String("conv_id", convID),
-			zap.Int("preview_rounds", previewRounds),
-			zap.Int("fids", len(lastPreviewFids)),
-			zap.Int("sids", len(lastPreviewSids)))
+		return false, ErrUpstream, errors.New("no image ref produced")
 	}
 
 	// 8) 对每个 ref 取签名 URL
@@ -494,18 +392,11 @@ loop:
 		return false, ErrDownload, errors.New("all download urls failed")
 	}
 
-	// 最终汇总:把"这次任务跑完,真正给用户的图"用一条 Info 打出来。
-	// 字段含义:
-	//   is_preview   —— 是否 IMG1 预览兜底(3 轮都 preview_only);false 表示 IMG2 或 SSE 直出
-	//   turns_used   —— 实际跑了几轮 f/conversation
-	//   refs         —— 最终采用的所有 file ref(sed: 前缀 = sediment,否则 file-service id)
-	//   signed_count —— 成功拿到签名 URL 的个数(可能 < len(refs) 如果部分 download 失败)
+	// 最终汇总:把这次任务实际返回给用户的图做一条结果日志。
 	logger.L().Info("image runner result summary",
 		zap.String("task_id", opt.TaskID),
 		zap.Uint64("account_id", lease.Account.ID),
 		zap.String("conv_id", convID),
-		zap.Int("turns_used", result.TurnsInConv),
-		zap.Bool("is_preview", result.IsPreview),
 		zap.Int("refs", len(fileRefs)),
 		zap.Strings("refs_list", fileRefs),
 		zap.Int("signed_count", len(signedURLs)),
